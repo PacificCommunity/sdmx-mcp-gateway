@@ -7,9 +7,14 @@ enabling automatic validation and JSON Schema generation for the MCP protocol.
 Following MCP SDK v2 best practices for structured output support.
 """
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+# Valid probe_data_url() status values. The tool only ever emits one of these;
+# callers (SuggestionResult.original_status, SuggestionProbeResult.status) pass
+# them through unchanged.
+ProbeStatus = Literal["nonempty", "empty", "error"]
 
 # =============================================================================
 # Common/Shared Schemas
@@ -59,8 +64,24 @@ class DataflowSummary(BaseModel):
     """Lightweight dataflow summary for list responses."""
 
     id: str = Field(description="Dataflow identifier")
+    agency: str = Field(
+        default="",
+        description=(
+            "Owning agency ID as reported by the provider. For OECD this is "
+            "typically a sub-agency (e.g. 'OECD.STI.STP', 'OECD.EDU.IMEP'); "
+            "pass it alongside the id on subsequent structure / data calls."
+        ),
+    )
     name: str = Field(description="Human-readable name")
     description: str = Field(description="Brief description (may be truncated)")
+    structure_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Full-structure URL (references=all) for this dataflow on the provider: "
+            "dataflow, DSD and all codelists in one request. Hand it verbatim to a "
+            "downstream SDMX-ML parser such as SDMXerWizard load_schema(url=...)."
+        ),
+    )
 
 
 class DataflowListResult(BaseModel):
@@ -142,9 +163,25 @@ class DataflowInfo(BaseModel):
     """Basic dataflow information."""
 
     id: str = Field(description="Dataflow identifier")
+    agency: str = Field(
+        default="",
+        description=(
+            "Owning agency ID. For OECD this is typically a sub-agency "
+            "(e.g. 'OECD.CFE.EDS'), and OECD also mirrors flows owned by other "
+            "agencies, so it cannot be inferred from the endpoint. Pass it "
+            "alongside the id on subsequent structure and data calls."
+        ),
+    )
     name: str = Field(description="Human-readable name")
     description: str = Field(description="Description")
     version: str = Field(description="Resolved version number")
+    structure_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Full-structure URL (references=all) for this dataflow on the provider, "
+            "ready for a downstream SDMX-ML parser such as SDMXerWizard load_schema(url=...)."
+        ),
+    )
 
 
 class AttributeDetail(BaseModel):
@@ -160,6 +197,16 @@ class StructureInfo(BaseModel):
     """Data structure definition information."""
 
     id: str = Field(description="Structure identifier")
+    agency: str = Field(
+        default="", description="Agency maintaining the data structure definition"
+    )
+    version: str = Field(
+        default="",
+        description=(
+            "Version of the data structure definition. This is the DSD's own "
+            "version and may differ from the dataflow's."
+        ),
+    )
     key_template: str = Field(
         description="Template showing dimension order (e.g., '{FREQ}.{GEO}.{INDICATOR}')"
     )
@@ -228,6 +275,10 @@ class DataAvailabilityResult(BaseModel):
     constraint_id: Optional[str] = Field(
         default=None, description="Constraint identifier if available"
     )
+    constraint_type: Optional[str] = Field(
+        default=None, description="Actual (confirmed data) or Allowed (schema-permitted)"
+    )
+    note: Optional[str] = Field(default=None, description="Why the answer is empty, when it is")
     time_range: Optional[TimeRange] = Field(default=None, description="Available time period range")
     cube_regions: list[CubeRegion] = Field(
         default_factory=list, description="Specific data regions available"
@@ -240,6 +291,9 @@ class DataAvailabilityResult(BaseModel):
     )
     data_exists: Optional[bool] = Field(
         default=None, description="Whether data exists for checked combination"
+    )
+    observation_count: Optional[int] = Field(
+        default=None, description="Observation count if the provider exposes it"
     )
     recommendation: Optional[str] = Field(
         default=None, description="Recommendation based on availability"
@@ -701,33 +755,9 @@ class EndpointListResult(BaseModel):
     note: str = Field(description="Usage hint")
 
 
-class EndpointSwitchResult(BaseModel):
-    """Result from switch_endpoint() tool."""
-
-    success: bool = Field(description="Whether the switch was successful")
-    message: str = Field(description="Status message")
-    new_endpoint: Optional[EndpointInfo] = Field(
-        default=None, description="New endpoint info if successful"
-    )
-    error: Optional[str] = Field(default=None, description="Error message if failed")
-    available_endpoints: Optional[list[str]] = Field(
-        default=None, description="Available endpoint keys if switch failed"
-    )
-    hint: Optional[str] = Field(default=None, description="Hint for fixing the error")
-
-
 # =============================================================================
 # Elicitation Schemas
 # =============================================================================
-
-
-class EndpointSwitchConfirmation(BaseModel):
-    """Schema for endpoint switch confirmation elicitation."""
-
-    confirm: bool = Field(default=False, description="Confirm switching to the new endpoint")
-    reason: Optional[str] = Field(
-        default=None, description="Optional reason for switching (for logging)"
-    )
 
 
 class DataQueryConfirmation(BaseModel):
@@ -774,3 +804,271 @@ class DiscoveryGuideResult(BaseModel):
         description="List of workflow steps with descriptions"
     )
     tips: list[str] = Field(description="Helpful tips for the discovery process")
+
+
+# =============================================================================
+# Query Probing Schemas
+# =============================================================================
+
+
+class DimensionSummary(BaseModel):
+    """Summary of observed values for one dimension in a probe result."""
+
+    distinct_count: int = Field(description="Number of distinct values observed")
+    sample_values: list[str] = Field(
+        default_factory=list, description="Sample of observed values"
+    )
+
+
+class SampleObservation(BaseModel):
+    """A single observation from the probe sample."""
+
+    dimensions: dict[str, str] = Field(description="Dimension values for this observation")
+    value: float | None = Field(default=None, description="Observation value")
+
+
+class ProbeResult(BaseModel):
+    """Result from probe_data_url() tool."""
+
+    status: ProbeStatus = Field(
+        description="Probe outcome: 'nonempty' if observations were returned, "
+        "'empty' if the query resolved to zero observations, 'error' if the "
+        "probe failed (HTTP error, parse failure, etc.)"
+    )
+    observation_count: int = Field(
+        default=0, description="Number of actual observations returned"
+    )
+    series_count: int = Field(
+        default=0, description="Number of distinct series"
+    )
+    time_period_count: int = Field(
+        default=0, description="Number of distinct time period values"
+    )
+    dimensions: dict[str, DimensionSummary] = Field(
+        default_factory=dict,
+        description="Summary of observed dimension values",
+    )
+    has_time_dimension: bool = Field(
+        default=False, description="Whether a time dimension was detected"
+    )
+    geo_dimension_id: str | None = Field(
+        default=None, description="Geography dimension ID if detected"
+    )
+    sample_observations: list[SampleObservation] = Field(
+        default_factory=list, description="Bounded sample of observations"
+    )
+    query_fingerprint: str = Field(
+        default="", description="SHA-256 fingerprint of the normalised query"
+    )
+    notes: list[str] = Field(
+        default_factory=list, description="Diagnostic notes"
+    )
+
+
+# =============================================================================
+# Suggestion Schemas
+# =============================================================================
+
+
+class SuggestionProbeResult(BaseModel):
+    """Compact probe result embedded in a suggestion."""
+
+    status: ProbeStatus = Field(description="Probe outcome for the suggested query")
+    observation_count: int = Field(default=0)
+    series_count: int = Field(default=0)
+    time_period_count: int = Field(default=0)
+
+
+class QuerySuggestion(BaseModel):
+    """A single non-empty query alternative."""
+
+    rank: int = Field(description="Rank by minimal deviation from original")
+    change_summary: str = Field(description="Human-readable description of the change")
+    changed_dimensions: list[str] = Field(description="Dimension IDs that were relaxed")
+    suggested_data_url: str = Field(description="Complete URL for the suggested query")
+    probe_result: SuggestionProbeResult = Field(description="Probe result for this suggestion")
+
+
+class SuggestionResult(BaseModel):
+    """Result from suggest_nonempty_queries() tool."""
+
+    original_status: ProbeStatus = Field(description="Probe status of the original query")
+    original_query_fingerprint: str = Field(default="", description="Fingerprint of original")
+    suggestions: list[QuerySuggestion] = Field(
+        default_factory=list, description="Ranked non-empty alternatives"
+    )
+    probes_used: int = Field(default=0, description="Number of probes consumed")
+    notes: list[str] = Field(default_factory=list, description="Diagnostic notes")
+
+
+# =============================================================================
+# Reference Metadata Schemas
+# =============================================================================
+
+
+class MetadataAttribute(BaseModel):
+    """One reference metadata attribute the provider declares for a dataflow.
+
+    `status` separates two answers this project has repeatedly conflated.
+    `populated` means the provider published a value. `declared_empty` means
+    the attribute was blank throughout the response read: for the whole
+    dataflow when no key was supplied, or for the slice queried when one
+    was, since a keyed request only reads that slice. Either way it is a
+    different statement from the attribute not existing, and the one that
+    tells a caller to go and ask the provider. An attribute the provider
+    never declared is absent from this list entirely.
+
+    `value` is filled when exactly one distinct value exists and either it
+    describes the whole dataflow (`dataflow` or `dataset` scope), or it was
+    identical on every data row the query actually returned
+    (`all_observed_rows` scope, e.g. SPC's `DF_SDG`, which publishes the
+    same value on every per-country row and has no dataflow-wide row at
+    all). The second case is a weaker claim than the first: it says nothing
+    about rows the query did not return, such as a different key or rows
+    beyond a truncated response's row cap, so `drill_down` stays true for
+    it even though `value` is filled. Where a value describes one slice
+    without appearing on every row read, such as OECD's recommended-uses
+    text that differs per country, `value` is null and `drill_down` is
+    true, because volunteering one country's text as the dataflow's answer
+    is wrong even when only one country has any.
+    """
+
+    id: str = Field(description="Attribute identifier")
+    path: str = Field(
+        description="Full path preserving MSD hierarchy; equals id where there is none"
+    )
+    label: str | None = Field(default=None, description="Human-readable label")
+    status: str = Field(description="populated or declared_empty")
+    scope: str | None = Field(
+        default=None,
+        description=(
+            "What the value attaches to: dataflow or partial_key from the MSD "
+            "channel; dataset, series or observation from the DSD-attribute "
+            "channel; or all_observed_rows, meaning it was identical on every "
+            "row this query returned, which is weaker than dataflow: a "
+            "provider never marked it unqualified, so rows outside the query "
+            "are not covered. Null when declared_empty."
+        ),
+    )
+    value_kind: str = Field(
+        default="unknown", description="prose, url, date or unknown"
+    )
+    distinct_values: int = Field(
+        default=0, description="How many distinct values exist; 0 when declared_empty"
+    )
+    value: str | None = Field(
+        default=None,
+        description=(
+            "The value, when it describes the whole dataflow (scope dataflow "
+            "or dataset) or was identical on every row this query returned "
+            "(scope all_observed_rows)"
+        ),
+    )
+    language: str | None = Field(
+        default=None, description="Language of value, when there is one"
+    )
+    sample_key_context: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "One example of the dimension values a partial-key value attaches "
+            "to. A sample, not the whole set: use get_metadata_attribute for all."
+        ),
+    )
+    drill_down: bool = Field(
+        default=False,
+        description="True when get_metadata_attribute would return more than this",
+    )
+
+
+class MetadataCoverage(BaseModel):
+    """How much of what the provider declares is actually filled in."""
+
+    declared: int = Field(description="Attributes the provider declares")
+    populated: int = Field(description="Attributes carrying at least one value")
+    empty: int = Field(description="Attributes declared and left blank")
+
+
+class MetadataValue(BaseModel):
+    """One value of one attribute, with the slice it applies to."""
+
+    value: str = Field(description="Parsed text, markup removed")
+    key_context: dict[str, str] | None = Field(
+        default=None,
+        description="Dimension values this applies to. Null means one of two "
+        "different things depending on the channel: from the MSD channel, "
+        "null means this value is dataflow-wide; from the DSD-attribute "
+        "fallback channel, null means the channel has no per-value key to "
+        "report at all, even when the value actually attaches to a series "
+        "or observation narrower than the whole dataflow. A note on the "
+        "result says which channel supplied the attribute.",
+    )
+    language: str | None = Field(default=None, description="Language of the value")
+
+
+class MetadataAttributeValuesResult(BaseModel):
+    """Result from get_metadata_attribute(): one attribute, every value."""
+
+    dataflow_id: str = Field(description="Dataflow queried")
+    attribute_id: str = Field(description="Attribute queried")
+    label: str | None = Field(default=None, description="Human-readable label")
+    status: str = Field(
+        description=(
+            "One of four outcomes, mirroring the populated/declared_empty "
+            "vocabulary on MetadataAttribute: 'values' -- the attribute has "
+            "values, returned in `values`. 'declared_empty' -- the provider "
+            "declares this attribute for this dataflow and published no "
+            "value. 'unknown_attribute' -- no such attribute in the "
+            "declared set; the declared ids are named in `notes`. "
+            "'unestablished' -- no channel resolved to a declared set, so "
+            "nothing can be concluded about whether the attribute exists. "
+            "This last value must never be rendered as 'no metadata': it is "
+            "not an observation that the attribute is absent, only that "
+            "this provider's channels could not confirm one way or the "
+            "other."
+        )
+    )
+    value_kind: str = Field(default="unknown", description="prose, url, date or unknown")
+    values: list[MetadataValue] = Field(default_factory=list, description="Values found")
+    total: int = Field(default=0, description="Count of (value, key_context) pairs found")
+    distinct_values: int = Field(
+        default=0,
+        description=(
+            "Count of distinct value texts among the values found. `total` "
+            "counts (value, key_context) pairs and answers a different "
+            "question: three countries publishing the same source "
+            "organisation give total: 3, distinct_values: 1. Counted over "
+            "the full uncapped set, not the capped 200, so it stays "
+            "truthful when `truncated` is true. 0 for the three non-'values' "
+            "statuses."
+        ),
+    )
+    truncated: bool = Field(
+        default=False, description="True when values holds fewer than total"
+    )
+    notes: list[str] = Field(default_factory=list, description="Remarks for the caller")
+
+
+class ReferenceMetadataResult(BaseModel):
+    """Result from get_reference_metadata()."""
+
+    dataflow_id: str = Field(description="Dataflow queried")
+    agency_id: str = Field(description="Owning agency")
+    endpoint: str | None = Field(default=None, description="Endpoint key")
+    version: str | None = Field(default=None, description="Resolved version")
+    metadata_attributes: list[MetadataAttribute] = Field(
+        default_factory=list, description="Reference metadata found"
+    )
+    coverage: MetadataCoverage | None = Field(
+        default=None,
+        description="Declared / populated / empty counts from the MSD channel, "
+        "the only channel that can see a declared-but-empty attribute; null "
+        "when the MSD channel did not answer found on an untruncated read",
+    )
+    channels: dict[str, str] = Field(
+        default_factory=dict,
+        description="State of each channel: found, empty, inconclusive, "
+        "too_broad, unsupported or skipped",
+    )
+    notes: list[str] = Field(
+        default_factory=list, description="Plain-language remarks for the caller"
+    )

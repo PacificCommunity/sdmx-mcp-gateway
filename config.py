@@ -48,6 +48,34 @@ SDMX_ENDPOINTS: dict[str, dict[str, Any]] = {
             "bulk": "contentconstraint",
         },
         "references_support": ["none", "children", "parents", "all"],
+        # Reference metadata via the .Stat Suite v2 MSD query. Verified 2026-07-29.
+        "metadata": {"v2_path": "/v2", "status": "supported"},
+    },
+    "FBOS": {
+        "name": "Fiji Bureau of Statistics",
+        "base_url": "https://data-sdmx-disseminate.statsfiji.gov.fj/rest",
+        "agency_id": "FBOS",
+        "description": "Fiji official national statistics",
+        "constraints": {
+            "single_flow": "availableconstraint",
+            "bulk": "contentconstraint",
+        },
+        "references_support": ["none", "children", "parents", "all"],
+        # Reference metadata via the .Stat Suite v2 MSD query. Verified 2026-07-29.
+        "metadata": {"v2_path": "/v2", "status": "supported"},
+    },
+    "SBS": {
+        "name": "Samoa Bureau of Statistics",
+        "base_url": "https://data-sdmx-disseminate.sbs.gov.ws/rest",
+        "agency_id": "SBS",
+        "description": "Samoa official national statistics",
+        "constraints": {
+            "single_flow": "availableconstraint",
+            "bulk": "contentconstraint",
+        },
+        "references_support": ["none", "children", "parents", "all"],
+        # Reference metadata via the .Stat Suite v2 MSD query. Verified 2026-07-29.
+        "metadata": {"v2_path": "/v2", "status": "supported"},
     },
     "ECB": {
         "name": "European Central Bank",
@@ -62,6 +90,13 @@ SDMX_ENDPOINTS: dict[str, dict[str, Any]] = {
             "bulk": "contentconstraint",
         },
         "references_support": ["none", "children", "parents", "all"],
+        # ECB never implemented standard SDMx-CSV. Its own 406 body lists
+        # text/csv and application/vnd.ecb.data+csv;version=1.0.0 instead.
+        # Verified live 2026-07-27. Both the "csv" and "sdmx-csv" aliases
+        # resolve to the same standard type elsewhere, so both are overridden
+        # here; otherwise a caller passing output_format="sdmx-csv" would
+        # still hit the 406.
+        "data_formats": {"csv": "text/csv", "sdmx-csv": "text/csv"},
     },
     "UNICEF": {
         "name": "UNICEF",
@@ -101,6 +136,8 @@ SDMX_ENDPOINTS: dict[str, dict[str, Any]] = {
         # not under bare "OECD". Use "all" to list dataflows across sub-agencies.
         "dataflow_agency": "all",
         "references_support": ["none", "children", "parents", "all"],
+        # Reference metadata via the .Stat Suite v2 MSD query. Verified 2026-07-29.
+        "metadata": {"v2_path": "/v2", "status": "supported"},
     },
     "ESTAT": {
         "name": "Eurostat",
@@ -128,6 +165,10 @@ SDMX_ENDPOINTS: dict[str, dict[str, Any]] = {
             "bulk": None,
         },
         "references_support": ["none", "children", "parents", "all"],
+        # ILO: /v2/ routes but the metadata query answers 500
+        # "The method or operation is not implemented". Verified 2026-07-29.
+        "metadata": {"status": "unsupported",
+                     "reason": "v2 metadata query is not implemented (HTTP 500)"},
     },
     "ABS": {
         "name": "Australian Bureau of Statistics",
@@ -141,6 +182,10 @@ SDMX_ENDPOINTS: dict[str, dict[str, Any]] = {
             "bulk": None,
         },
         "references_support": ["none", "children", "parents", "all"],
+        # ABS: /v2/ routes but the metadata query answers 404
+        # "Could not find Dataflow and/or DSD". Verified 2026-07-29.
+        "metadata": {"status": "unsupported",
+                     "reason": "v2 metadata query returns 404 for known dataflows"},
     },
     "BIS": {
         "name": "Bank for International Settlements",
@@ -153,6 +198,34 @@ SDMX_ENDPOINTS: dict[str, dict[str, Any]] = {
             "bulk": None,
         },
         "references_support": ["none", "children", "parents", "all"],
+    },
+    "STATSNZ": {
+        "name": "Stats NZ (Aotearoa Data Explorer)",
+        "base_url": "https://api.data.stats.govt.nz/rest",
+        "agency_id": "STATSNZ",
+        "description": "New Zealand official statistics",
+        "constraints": {
+            # Live-probed 2026-04-21:
+            # - /availableconstraint/{flow}/all/all/all returns Actual
+            #   ContentConstraint with per-dimension KeyValues (~3.6KB).
+            # - /contentconstraint/STATSNZ/all/latest returns 50MB+ and times
+            #   out; wildcard /availableconstraint/all/all/all/all returns 500.
+            "single_flow": "availableconstraint",
+            "bulk": None,
+        },
+        "references_support": ["none", "children", "parents", "all"],
+        # Subscription-gated API. Client reads the env var and injects the
+        # header as a default on httpx.AsyncClient so every request carries it.
+        "auth": {
+            "header": "Ocp-Apim-Subscription-Key",
+            "env": "SDMX_STATSNZ_KEY",
+        },
+        # Stats NZ's APIM gateway ignores the SDMX Accept header and returns
+        # SDMX-JSON by default for structural metadata. The client parses XML,
+        # so force format=xml on every request via a default query param.
+        "default_query_params": {
+            "format": "xml",
+        },
     },
 }
 
@@ -176,6 +249,19 @@ def get_constraint_strategy(endpoint_key: str, kind: str = "single_flow") -> str
     if constraints is None:
         return None
     return constraints.get(kind)
+
+
+def get_metadata_support(endpoint_key: str | None) -> dict[str, str] | None:
+    """What this endpoint offers for reference metadata, if anything.
+
+    None means the provider exposes no `/v2/` endpoint at all, so the MSD
+    channel does not apply and only the DSD attribute fallback is available.
+    """
+    ep = SDMX_ENDPOINTS.get(endpoint_key) if endpoint_key else None
+    if not ep:
+        return None
+    support = ep.get("metadata")
+    return dict(support) if support else None
 
 
 def get_dataflow_agency(endpoint_key: str) -> str | None:
@@ -222,15 +308,43 @@ def get_best_references(endpoint_key: str | None, desired: str) -> str | None:
     return None
 
 
+_STANDARD_DATA_ACCEPT: dict[str, str] = {
+    "csv": "application/vnd.sdmx.data+csv;version=1.0.0",
+    "json": "application/vnd.sdmx.data+json;version=1.0.0",
+    "xml": "application/vnd.sdmx.genericdata+xml;version=2.1",
+    "generic": "application/vnd.sdmx.genericdata+xml;version=2.1",
+    "structurespecific": "application/vnd.sdmx.structurespecificdata+xml;version=2.1",
+    "sdmx-json": "application/vnd.sdmx.data+json;version=1.0.0",
+    "sdmx-csv": "application/vnd.sdmx.data+csv;version=1.0.0",
+    "sdmx-xml": "application/vnd.sdmx.genericdata+xml;version=2.1",
+}
+
+
+def get_data_accept(endpoint_key: str | None, output_format: str) -> str:
+    """The media type this endpoint actually accepts for a data format.
+
+    Most providers take the standard SDMx types. Where one does not, its
+    entry declares a `data_formats` override; ECB is the case that forced
+    this, answering 406 to standard SDMx-CSV.
+    """
+    fmt = output_format.lower()
+    standard = _STANDARD_DATA_ACCEPT.get(fmt, _STANDARD_DATA_ACCEPT["csv"])
+    ep = SDMX_ENDPOINTS.get(endpoint_key) if endpoint_key else None
+    if not ep:
+        return standard
+    return ep.get("data_formats", {}).get(fmt, standard)
+
+
 def get_current_config() -> dict[str, Any]:
     """
     Get current SDMX endpoint configuration.
 
+    Reads from environment (SDMX_BASE_URL / SDMX_AGENCY_ID / SDMX_ENDPOINT)
+    at call time; these values are process-wide and not mutated at runtime.
+
     Returns:
         Dict with base_url, agency_id, name, description, constraints
     """
-    global _current_endpoint_key
-
     # If environment variables are set, use custom endpoint
     if _env_base_url:
         return {
@@ -249,32 +363,10 @@ def get_current_config() -> dict[str, Any]:
     return SDMX_ENDPOINTS["SPC"]
 
 
-def set_endpoint(endpoint_key: str) -> dict[str, Any]:
-    """
-    Switch to a different SDMX endpoint.
-
-    Args:
-        endpoint_key: Key from SDMX_ENDPOINTS dict
-
-    Returns:
-        The new configuration dict
-    """
-    global _current_endpoint_key, SDMX_BASE_URL, SDMX_AGENCY_ID
-
-    if endpoint_key not in SDMX_ENDPOINTS:
-        available = ", ".join(SDMX_ENDPOINTS.keys())
-        raise ValueError(
-            "Unknown endpoint: " + endpoint_key + ". Available: " + available
-        )
-
-    _current_endpoint_key = endpoint_key
-    config = get_current_config()
-    # Update the module-level variables
-    SDMX_BASE_URL = config["base_url"]
-    SDMX_AGENCY_ID = config["agency_id"]
-    return config
-
-
-# Initialize module-level variables
+# Startup-time module defaults. Captured from the current config at import
+# time and never rewritten: this module has no set_endpoint() anymore. The
+# per-session pool always passes explicit base_url / agency_id to
+# SDMXProgressiveClient, so these values are only read by the legacy
+# no-kwargs constructor path and by callers that explicitly import them.
 SDMX_BASE_URL = get_current_config()["base_url"]
 SDMX_AGENCY_ID = get_current_config()["agency_id"]

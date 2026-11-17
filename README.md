@@ -10,23 +10,47 @@ A Model Context Protocol (MCP) server that provides progressive discovery tools 
 - **Structured Outputs**: All tools return validated Pydantic models
 - **Multiple Transports**: STDIO (development) and Streamable HTTP (production)
 - **Interactive Elicitation**: User confirmation dialogs for endpoint switching
-- **Multi-Provider Support**: SPC, ECB, UNICEF, IMF data sources
+- **Multi-Provider Support**: SPC, FBOS, SBS, ECB, UNICEF, IMF, OECD, ESTAT, ILO, ABS, BIS
 
 ## Quick Start
 
+A public instance of this server is hosted on Railway. Point any MCP client at the URL below and you can skip cloning, installing dependencies, and managing a Python environment.
+
+```
+https://sdmx-mcp-gateway-production.up.railway.app/mcp
+```
+
+Transport is Streamable HTTP. The endpoint is shared and stateless from the client's perspective; each MCP session gets its own server-side state (endpoint selection, client pool, mismatch-hint cache).
+
+Quick check that it responds:
+
 ```bash
-# Install dependencies
+curl -X POST https://sdmx-mcp-gateway-production.up.railway.app/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
+```
+
+See [MCP Client Configuration](#mcp-client-configuration) for ready-to-paste configs for Claude Code, Claude Desktop, Codex, Cursor, Zed, and OpenCode.
+
+### Health Status
+
+A standalone monitor checks the hosted gateway and every provider endpoint
+(through the gateway and directly) every two hours. See `monitor/README.md`
+for running or deploying it. Once deployed, its status page shows current
+health, per-endpoint history, and whether a failure sits in the gateway or
+the upstream provider.
+
+### Self-Hosting
+
+If you prefer to run the server yourself (offline use, private deployments, development on the tools themselves), see [Installation](#installation) and [Running the Server](#running-the-server).
+
+```bash
 cd sdmx-mcp-gateway
 uv sync
-
-# Run the server (STDIO mode for development)
-uv run python main_server.py
-
-# Run with MCP Inspector
-uv run mcp dev ./main_server.py
-
-# Run in production mode (Streamable HTTP)
-uv run python main_server.py --transport http --port 8000 --stateless --json-response
+uv run python main_server.py                                     # STDIO, for local clients
+uv run python main_server.py --transport http --port 8000        # HTTP, for remote clients
+uv run mcp dev ./main_server.py                                  # MCP Inspector (browser UI)
 ```
 
 ## The Problem We Solve
@@ -81,14 +105,50 @@ sdmx-mcp-gateway/
 | `build_data_url`         | Generate data retrieval URL               | `DataUrlResult`             |
 | `get_codelist`           | Browse specific codelist                  | `dict`                      |
 
+Every dataflow returned by `list_dataflows` and `get_dataflow_structure` carries a `structure_url`: the provider's full-structure query (`references=all`) for that dataflow, dataflow plus DSD plus every codelist in one request. Progressive discovery keeps that payload out of the model's context; the URL lets a downstream parser fetch it once when it needs the whole thing, for example [SDMXerWizard](https://github.com/Baffelan/SDMXerWizard.jl)'s `load_schema(url=...)`.
+
+SDMX 2.1 has no server-side pagination, so `list_dataflows` fetches a provider's entire dataflow listing under the hood even when `limit` is small; for ESTAT that listing alone is 37 MB. The parsed result is cached process-wide (shared across every session, not per client) for `DATAFLOW_CACHE_TTL_S` seconds (default `900`, 15 minutes), keyed on the base URL, agency, and the other parameters that change the answer. The result's `next_step` field always states whether that call was served from cache and, if so, how old the entry is, so a caller never has to guess. Pass `fresh=True` to bypass the cache and force a live re-fetch; the fresh result still refreshes the cache for everyone else. Use `fresh=True` for liveness checks, where a cached answer would say nothing about whether the provider is reachable right now.
+
+### Reference Metadata
+
+| Tool                      | Description                                          | Output Schema             |
+| -------------------------- | ----------------------------------------------------- | -------------------------- |
+| `get_reference_metadata`  | Summarise source, methodology, licence and caveats for a dataflow | `ReferenceMetadataResult` |
+| `get_metadata_attribute`  | Get every value of one metadata attribute, with the slice each applies to | `MetadataAttributeValuesResult` |
+
+Reference metadata is the descriptive material about a dataflow rather than its structure: who compiled it, from what source, under what licence, with what caveats. Coverage varies by provider, so the result's `channels` field reports which channel was available: `.Stat Suite` deployments (SPC, FBOS, SBS, OECD) publish it through a v2 MSD query, some other providers carry equivalent detail only in ordinary DSD attributes on the data message, and some publish neither. A channel status of `inconclusive` means the query did not produce a usable answer; that is different from a confirmed absence, which is what `empty` reports.
+
+Pass `key` to narrow the query to one series. This matters for large dataflows: SPC's `DF_SDG` metadata query is 5.37 MB unfiltered against 5.6 KB with a partial key, and the tool refuses an unfiltered query over 2 MB (`too_broad`) by aborting the read partway through rather than downloading it in full; the same cap applies to both the MSD query and the DSD-attribute fallback used by providers without a `/v2/` endpoint.
+
+#### `get_reference_metadata`: the summary
+
+`get_reference_metadata` returns one entry per attribute the provider declares, in `metadata_attributes`, plus a `coverage` count and a per-channel `channels` status. Each attribute carries:
+
+- `status`: `populated` when the provider published at least one value, `declared_empty` when every occurrence in the response read was blank -- for the whole dataflow when no key was supplied, or for the slice queried when one was, since a keyed request only reads that slice. A declared-but-empty attribute is a real, observed answer, not a missing one, and it is listed rather than omitted, so a blank licence field reads differently from a provider that has no licence concept at all.
+- `value` and `drill_down`: `value` carries the headline text when exactly one distinct value exists and either it describes the whole dataflow (`dataflow`/`dataset` scope, provider-marked unqualified), or it was identical on every data row this query actually returned (`all_observed_rows` scope). The second case is common: SPC's `DF_SDG` publishes the same value on every per-country row and has no dataflow-wide row at all, so before this rule every one of its populated attributes came back `value: null`. `drill_down` is `false` only for `dataflow`/`dataset` scope; for `all_observed_rows` it stays `true`, since that scope says nothing about rows the query did not return (a different key, or rows beyond a truncated response's row cap) and the per-row detail behind it still matters. When the attribute's values differ across the rows read, `value` is `null` and `drill_down` is `true`, meaning no single value can stand in as the answer.
+- `distinct_values` and `scope`: how many distinct values were found, and what the headline (when present) attaches to: the whole dataflow (`dataflow`/`dataset`), every row this query returned (`all_observed_rows`, weaker than `dataflow`: no provider ever marked it unqualified), or one slice (`partial_key`).
+
+`coverage` (`declared` / `populated` / `empty`) is reported only when the MSD channel itself answered `found` on an untruncated read: that is the only channel that can see a declared-but-empty attribute (`parse_msd_csv`'s `declared_empty` status). Neither an MSD `empty` answer nor the DSD-attribute fallback can establish it, even when both agree: the DSD fallback only ever sees what a message actually populates, so it can never confirm that a provider declares nothing further, and a truncated MSD read cannot rule out a value past the row cap. `coverage` is `None` in every one of those cases -- when the only channel that answered was the DSD-attribute fallback, which shows populated attributes only; when the MSD channel answered `empty` (with or without the DSD fallback also resolving); or when the MSD channel found something but the read was cut off before finishing.
+
+#### `get_metadata_attribute`: the drill-down
+
+Call `get_metadata_attribute(dataflow_id, attribute_id, key=None, agency_id=None)` after `get_reference_metadata` reports `drill_down: true` for an attribute, to read every distinct value with the dimension key (`key_context`) it applies to. `attribute_id` is the short `id` from the summary, not the full dotted `path`. The result (`MetadataAttributeValuesResult`) has no separate error field; every case below is a normally-shaped result distinguished by `total` and by the text of `notes`. Four answers matter and are kept distinct:
+
+- **Populated**: one entry per distinct (value, `key_context`) pair; the same value may appear multiple times with different `key_context` values. `total` counts these pairs, while the summary's `distinct_values` counts distinct values only (the two need not match), and `truncated` is `true` when more than 200 pairs exist, with `values` limited to the first 200.
+- **Declared but empty**: `total: 0`, `values: []`, and a note stating the attribute is declared and left blank -- for the whole dataflow when no key was supplied, for the slice queried when one was. The first note does not start with `"Error:"`.
+- **Unknown attribute id**: `total: 0`, `values: []`, and a first note starting with `"Error: "` reading `"Error: Unknown attribute '<id>' for <dataflow>: declared attributes are <ids>"`, naming the dataflow's declared attribute ids so a typo reads as "here is what exists" rather than as an empty result. This wording is only used when the MSD channel itself answered `found`: that is the one channel outcome that can vouch for a provider's full declared set, so the listed ids are genuinely everything declared. A caller distinguishes this from the declared-but-empty case above by checking whether the first note starts with `"Error:"`, not by looking for a field that does not exist on this result.
+- **No channel confirmed a declared set**: `total: 0`, `values: []`, and notes explaining which channel could not answer and why that is not evidence the attribute is missing. This covers an MSD channel that answered `too_broad`, `inconclusive` or `unsupported`, and also the MSD channel's own `empty` answer -- even when the DSD-attribute fallback separately found something or itself resolved to `empty`, since that fallback only ever sees what a message actually populates and can never see an attribute the DSD declares but a given response leaves blank, so it cannot vouch for the full declared set on its own. Like the declared-but-empty case, the notes here do not start with `"Error:"`.
+
+Each value's `key_context` is `null` in two different situations that a caller must not conflate: from the MSD channel, `null` means the value is genuinely dataflow-wide; from the DSD-attribute fallback channel (used by providers without a `/v2/` endpoint), `null` means that channel has no per-value key to report at all, even when the value actually attaches to one series or observation rather than to the whole dataflow. A note on the result says which channel supplied the attribute when this applies.
+
 ### Endpoint Management
 
 | Tool                          | Description                            | Output Schema          |
 | ----------------------------- | -------------------------------------- | ---------------------- |
-| `get_current_endpoint`        | Show active data source                | `EndpointInfo`         |
-| `list_available_endpoints`    | List all providers                     | `EndpointListResult`   |
-| `switch_endpoint`             | Change data provider                   | `EndpointSwitchResult` |
-| `switch_endpoint_interactive` | Interactive selection with elicitation | `EndpointSwitchResult` |
+| `get_current_endpoint`        | Show the session's default provider    | `EndpointInfo`         |
+| `list_available_endpoints`    | List all configured providers          | `EndpointListResult`   |
+
+The session default is set once at startup from the `SDMX_ENDPOINT` env var and is not mutable at runtime. To target a specific provider for an individual call, pass `endpoint=<KEY>` to any endpoint-scoped tool.
 
 ### Resources
 
@@ -106,22 +166,32 @@ sdmx-mcp-gateway/
 
 ## Supported Data Sources
 
-| Key      | Provider                    | Description                           |
-| -------- | --------------------------- | ------------------------------------- |
-| `SPC`    | Pacific Data Hub            | Pacific regional statistics (default) |
-| `ECB`    | European Central Bank       | European financial statistics         |
-| `UNICEF` | UNICEF                      | Children and youth statistics         |
-| `IMF`    | International Monetary Fund | Global financial statistics           |
+| Key      | Provider                         | Description                           | Constraints        |
+| -------- | -------------------------------- | ------------------------------------- | ------------------ |
+| `SPC`    | Pacific Data Hub                 | Pacific regional statistics (default) | Actual (single + bulk) |
+| `FBOS`   | Fiji Bureau of Statistics        | Fiji official national statistics     | Actual (single + bulk) |
+| `SBS`    | Samoa Bureau of Statistics       | Samoa official national statistics    | Actual (single + bulk) |
+| `ECB`    | European Central Bank            | European financial statistics         | Allowed (single + bulk) |
+| `UNICEF` | UNICEF                           | Children and youth statistics         | Actual (single + bulk) |
+| `IMF`    | International Monetary Fund      | Global financial statistics           | Actual (single) |
+| `OECD`   | OECD                             | Economic and social statistics        | Actual (single) |
+| `BIS`    | Bank for International Settlements | International financial statistics  | Actual (single) |
+| `ABS`    | Australian Bureau of Statistics  | Australian official statistics        | Actual (single) |
+| `ILO`    | International Labour Organization | Labour and employment statistics     | Actual (single) |
+| `ESTAT`  | Eurostat                         | European Union official statistics    | None |
 
-Switch providers using:
+Target a provider per call:
 
 ```python
-# Direct switch
-switch_endpoint("ECB")
+# Pass endpoint= on any endpoint-scoped tool
+list_dataflows(endpoint="ECB", limit=10)
+get_dataflow_structure(dataflow_id="DF_CPI", endpoint="FBOS")
 
-# Interactive selection (with elicitation)
-switch_endpoint_interactive()
+# Or rely on the session default (set at startup from SDMX_ENDPOINT env var)
+list_dataflows(limit=10)
 ```
+
+See `docs/ENDPOINT_CONFIGURATION.md` for provider-specific behaviours and constraint strategies.
 
 ## Installation
 
@@ -160,8 +230,8 @@ uv run python main_server.py [OPTIONS]
 
 Options:
   --transport, -t    Transport type: stdio, http, streamable-http (default: stdio)
-  --host             Host for HTTP transport (default: 127.0.0.1)
-  --port, -p         Port for HTTP transport (default: 8000)
+  --host             Host for HTTP transport (default: HOST env or 0.0.0.0)
+  --port, -p         Port for HTTP transport (default: PORT env or 8000)
   --stateless        Run in stateless mode (HTTP only)
   --json-response    Use JSON responses instead of SSE (HTTP only)
   --debug            Enable debug logging
@@ -180,54 +250,123 @@ uv run mcp dev ./main_server.py
 ### Production Mode (Streamable HTTP)
 
 ```bash
-uv run python main_server.py --transport http --port 8000 --stateless --json-response
+uv run python main_server.py --transport streamable-http --host 0.0.0.0 --port "${PORT:-8000}"
 ```
+
+For container platforms such as Vercel, Railway, or Fly, prefer binding to `0.0.0.0`
+and reading the port from the platform-provided `PORT` environment variable. The
+server now fails fast if the installed MCP SDK ignores the requested HTTP bind
+settings, rather than silently falling back to localhost.
 
 ## MCP Client Configuration
 
-### Prerequisites
+The recommended path is to point your client at the hosted Railway URL. Each section below shows:
 
-Before configuring any MCP client, ensure you have:
+- **Hosted (HTTP)**: uses `https://sdmx-mcp-gateway-production.up.railway.app/mcp`. Nothing to install beyond the client itself.
+- **Self-hosted (STDIO)**: runs the server from a clone of this repo. Requires `uv` and `git` (see [Installation](#installation)).
 
-1. **Install uv** (recommended Python package manager):
+Clients that only speak STDIO can still reach the hosted instance via the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, which proxies HTTP MCP servers through stdio via `npx`.
 
-    ```bash
-    # macOS/Linux
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+### Claude Code
 
-    # Windows
-    powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+Hosted, one-liner:
 
-    # Or via pip
-    pip install uv
-    ```
+```bash
+claude mcp add --transport http sdmx-gateway https://sdmx-mcp-gateway-production.up.railway.app/mcp
+```
 
-2. **Clone and set up the project**:
+Or in `.claude/settings.json` / `~/.claude/settings.json`:
 
-    ```bash
-    git clone <repository-url>
-    cd sdmx-mcp-gateway
-    uv sync  # Installs all dependencies
-    ```
+```json
+{
+    "mcpServers": {
+        "sdmx-gateway": {
+            "type": "http",
+            "url": "https://sdmx-mcp-gateway-production.up.railway.app/mcp"
+        }
+    }
+}
+```
 
-3. **Verify installation**:
-    ```bash
-    uv run python main_server.py --help
-    ```
+Self-hosted (STDIO):
 
-> **Alternative without uv**: If you prefer not to use `uv`, you can install dependencies with pip in a virtual environment:
->
-> ```bash
-> python -m venv .venv
-> source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-> pip install -e .
-> ```
->
-> Then replace `"command": "uv"` with the full path to your venv's python, and adjust args accordingly.
+```json
+{
+    "mcpServers": {
+        "sdmx-gateway": {
+            "command": "uv",
+            "args": [
+                "run",
+                "--directory",
+                "/path/to/sdmx-mcp-gateway",
+                "python",
+                "main_server.py"
+            ]
+        }
+    }
+}
+```
+
+> If `uv` is not on your PATH, use the full path (e.g. `"/home/user/.local/bin/uv"`).
+
+### OpenAI Codex CLI
+
+Hosted, via `~/.codex/config.toml` (uses `mcp-remote` to bridge HTTP into stdio):
+
+```toml
+[mcp_servers.sdmx]
+command = "npx"
+args = ["-y", "mcp-remote", "https://sdmx-mcp-gateway-production.up.railway.app/mcp"]
+enabled = true
+tool_timeout_sec = 120
+```
+
+Or via the CLI:
+
+```bash
+codex mcp add sdmx -- npx -y mcp-remote https://sdmx-mcp-gateway-production.up.railway.app/mcp
+```
+
+Self-hosted:
+
+```toml
+[mcp_servers.sdmx]
+command = "uv"
+args = ["run", "--directory", "/path/to/sdmx-mcp-gateway", "python", "main_server.py"]
+enabled = true
+tool_timeout_sec = 120
+```
+
+> The `command` field must be the executable only. If `uv` or `npx` is not on your PATH, use the full path. Arguments go in `args` as a separate array.
 
 ### Claude Desktop
 
-**Linux** (`~/.config/Claude/claude_desktop_config.json`):
+Claude Desktop does not yet speak HTTP MCP natively, so use `mcp-remote` to reach the hosted server.
+
+Config file locations:
+
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Hosted:
+
+```json
+{
+    "mcpServers": {
+        "sdmx-gateway": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote",
+                "https://sdmx-mcp-gateway-production.up.railway.app/mcp"
+            ]
+        }
+    }
+}
+```
+
+Self-hosted (STDIO):
 
 ```json
 {
@@ -246,67 +385,49 @@ Before configuring any MCP client, ensure you have:
 }
 ```
 
-**macOS** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-
-```json
-{
-    "mcpServers": {
-        "sdmx-gateway": {
-            "command": "uv",
-            "args": [
-                "run",
-                "--directory",
-                "/path/to/sdmx-mcp-gateway",
-                "python",
-                "main_server.py"
-            ]
-        }
-    }
-}
-```
-
-**Windows** (`%APPDATA%\Claude\claude_desktop_config.json`):
-
-```json
-{
-    "mcpServers": {
-        "sdmx-gateway": {
-            "command": "uv",
-            "args": [
-                "run",
-                "--directory",
-                "C:\\path\\to\\sdmx-mcp-gateway",
-                "python",
-                "main_server.py"
-            ]
-        }
-    }
-}
-```
+> On Windows, escape the path: `"C:\\path\\to\\sdmx-mcp-gateway"`.
 
 ### Cursor
 
-1. Go to **Cursor Settings > MCP**
-2. Add new global MCP server
-3. Use the configuration above
+1. Open **Cursor Settings > MCP**.
+2. Add a new global MCP server.
+3. Set the URL to `https://sdmx-mcp-gateway-production.up.railway.app/mcp` (Cursor supports Streamable HTTP servers directly).
+
+For a self-hosted instance, use the STDIO command shown for Claude Code.
 
 ### Zed
 
-Zed uses "Context Servers" for MCP integration. Add the following to your Zed settings:
-
-**Location**:
+Zed uses "Context Servers" for MCP integration. Settings file:
 
 - Linux: `~/.config/zed/settings.json`
 - macOS: `~/Library/Application Support/Zed/settings.json`
 - Project-specific: `.zed/settings.json` in your project root
 
-Add the `context_servers` key at the **top level** of your settings.json (alongside other settings like `theme`, `ui_font_size`, etc.):
+Add the `context_servers` key at the **top level** of your settings.json, alongside other settings like `theme` and `ui_font_size`.
+
+Hosted (via `mcp-remote`):
 
 ```json
 {
-    "theme": "One Dark",
-    "ui_font_size": 16,
+    "context_servers": {
+        "sdmx-gateway": {
+            "command": {
+                "path": "npx",
+                "args": [
+                    "-y",
+                    "mcp-remote",
+                    "https://sdmx-mcp-gateway-production.up.railway.app/mcp"
+                ]
+            }
+        }
+    }
+}
+```
 
+Self-hosted:
+
+```json
+{
     "context_servers": {
         "sdmx-gateway": {
             "command": {
@@ -324,44 +445,42 @@ Add the `context_servers` key at the **top level** of your settings.json (alongs
 }
 ```
 
-If you already have a `context_servers` section, just add the `"sdmx-gateway": {...}` entry inside it.
-
 ### OpenCode
 
-Add to your OpenCode configuration file (`~/.config/opencode/config.json`):
+`~/.config/opencode/config.json`:
 
 ```json
 {
     "mcpServers": {
         "sdmx-gateway": {
-            "command": "uv",
+            "command": "npx",
             "args": [
-                "run",
-                "--directory",
-                "/path/to/sdmx-mcp-gateway",
-                "python",
-                "main_server.py"
+                "-y",
+                "mcp-remote",
+                "https://sdmx-mcp-gateway-production.up.railway.app/mcp"
             ]
         }
     }
 }
 ```
 
-Or use environment variable configuration:
-
-```bash
-export OPENCODE_MCP_SERVERS='{"sdmx-gateway":{"command":"uv","args":["run","--directory","/path/to/sdmx-mcp-gateway","python","main_server.py"]}}'
-```
+Or, for a self-hosted instance, swap to the `uv run ...` command shown in the Claude Code section.
 
 ### Generic MCP Client (Streamable HTTP)
 
-For any MCP client that supports Streamable HTTP transport, start the server in HTTP mode:
+Any client with Streamable HTTP support connects directly to the hosted URL:
 
-```bash
-uv run python main_server.py --transport http --port 8000 --stateless --json-response
+```
+https://sdmx-mcp-gateway-production.up.railway.app/mcp
 ```
 
-Then configure your client to connect to `http://localhost:8000/mcp`.
+To run your own HTTP instance locally:
+
+```bash
+uv run python main_server.py --transport http --port 8000
+```
+
+Point the client at `http://localhost:8000/mcp`. Add `--stateless --json-response` if your client cannot consume Server-Sent Events.
 
 ## Usage Examples
 
@@ -546,23 +665,17 @@ graph LR
     style chg_CL_GEO fill:#fff9c4,stroke:#fbc02d
 ```
 
-### Interactive Endpoint Switching
+### Targeting a Provider Per Call
 
-For clients that support elicitation (shows interactive form):
-
-```python
-switch_endpoint_interactive()
-# → Shows form to select endpoint and confirm
-# → Returns: EndpointSwitchResult
-```
-
-For clients without elicitation support:
+Every endpoint-scoped tool accepts an optional `endpoint=<KEY>` argument:
 
 ```python
-switch_endpoint("ECB")
-# → Directly switches to ECB
-# → Returns: EndpointSwitchResult
+list_dataflows(endpoint="ECB", limit=10)
+get_dataflow_structure(dataflow_id="EXR", endpoint="ECB")
+build_data_url(dataflow_id="DF_CPI", filters={"GEO_AREA": "FJI"}, endpoint="FBOS")
 ```
+
+Calls without `endpoint=` use the session's default (set at server startup from the `SDMX_ENDPOINT` env var). Parallel calls to different providers are safe — each resolves independently.
 
 ## Structured Outputs
 
@@ -608,19 +721,11 @@ uv run pytest tests/e2e/
 
 ## Known Limitations
 
-### Multi-User Endpoint Switching
+### Multi-User Endpoint Isolation
 
-The endpoint switching uses global state. In multi-user deployments, switching affects all users. Suitable for:
+Each MCP session has its own client pool (one `SDMXProgressiveClient` per endpoint it has touched) and its own mismatch-hint registry. STDIO mode uses a single session; HTTP transport uses `Mcp-Session-Id` headers for per-user isolation. Sessions timeout after 30 minutes of inactivity. The session default endpoint is immutable at runtime — set it via the `SDMX_ENDPOINT` env var at server startup.
 
-- Single-user Claude Desktop integration
-- Local development
-- Single-tenant deployments
-
-See `MULTI_USER_CONSIDERATIONS.md` for production alternatives.
-
-### Elicitation Support
-
-Interactive tools (`switch_endpoint_interactive`) require client elicitation support. Clients without support receive a helpful fallback message with available endpoints.
+See `docs/MULTI_USER_CONSIDERATIONS.md` for production deployment details.
 
 ## Project Status
 

@@ -2,13 +2,14 @@
 Unit tests for SDMXProgressiveClient.
 """
 
-import xml.etree.ElementTree as ET
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
-from sdmx_progressive_client import SDMXProgressiveClient
+import sdmx_progressive_client as sdmx_client_module
+from sdmx_progressive_client import SDMXProgressiveClient, clear_dataflow_cache
 
 
 class TestSDMXProgressiveClient:
@@ -310,7 +311,7 @@ class TestSDMXProgressiveClient:
     async def test_context_integration(self, client, mock_dataflow_response):
         """Test MCP Context integration with progress reporting."""
         mock_context = Mock()
-        mock_context.info = Mock()
+        mock_context.info = AsyncMock()
         mock_context.report_progress = AsyncMock()
 
         mock_response = Mock()
@@ -333,6 +334,148 @@ class TestSDMXProgressiveClient:
             assert any(call[0][0] == 100 for call in progress_calls)  # Ended at 100
 
 
+class TestDataflowOverviewAgencyFallback:
+    """get_dataflow_overview retries with agency='all' on 404.
+
+    Motivation: OECD publishes flows under ~50 sub-agencies (e.g. the flow
+    DSD_RDS_GERD@DF_GERD_SOF is owned by OECD.STI.STP, not bare OECD).
+    Callers that don't know the owning sub-agency would otherwise need a
+    pre-flight list_dataflows or codelist walk just to resolve one structure.
+    SDMX 2.1 REST documents `all` as a valid wildcard for the `agencies`
+    path parameter on /dataflow/ — this test pins that we actually use it.
+    """
+
+    @pytest.fixture
+    def wildcard_response_xml(self) -> str:
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<str:Structure xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"
+               xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">
+    <str:Structures>
+        <str:Dataflows>
+            <str:Dataflow id="DSD_RDS_GERD@DF_GERD_SOF" agencyID="OECD.STI.STP" version="1.0">
+                <com:Name>R&amp;D expenditure by source of funds</com:Name>
+                <com:Description>Test flow owned by a sub-agency</com:Description>
+                <str:Structure>
+                    <Ref id="DSD_RDS_GERD" agencyID="OECD.STI.STP" version="1.0"/>
+                </str:Structure>
+            </str:Dataflow>
+        </str:Dataflows>
+    </str:Structures>
+</str:Structure>"""
+
+    @pytest.mark.asyncio
+    async def test_retries_with_all_on_404_and_recovers_real_agency(
+        self, wildcard_response_xml
+    ):
+        """A 404 on bare-agency triggers one retry with agency='all'; the
+        real sub-agency is read from the XML response and surfaced on
+        DataflowOverview.agency."""
+        client = SDMXProgressiveClient(
+            base_url="https://sdmx.oecd.org/public/rest", agency_id="OECD"
+        )
+
+        not_found_response = Mock()
+        not_found_response.status_code = 404
+        not_found_response.raise_for_status = Mock(
+            side_effect=httpx.HTTPStatusError(
+                "404", request=Mock(), response=Mock(status_code=404)
+            )
+        )
+
+        ok_response = Mock()
+        ok_response.status_code = 200
+        ok_response.content = wildcard_response_xml.encode("utf-8")
+        ok_response.raise_for_status = Mock()
+
+        with patch.object(client, "_get_session") as mock_session:
+            mock_http = AsyncMock()
+            mock_http.get.side_effect = [not_found_response, ok_response]
+            mock_session.return_value = mock_http
+
+            overview = await client.get_dataflow_overview(
+                "DSD_RDS_GERD@DF_GERD_SOF"
+            )
+
+        assert mock_http.get.call_count == 2, (
+            "Expected exactly two HTTP calls — one to the configured agency, "
+            "one to the 'all' wildcard fallback."
+        )
+        first_url = mock_http.get.call_args_list[0][0][0]
+        second_url = mock_http.get.call_args_list[1][0][0]
+        assert "/dataflow/OECD/DSD_RDS_GERD@DF_GERD_SOF/" in first_url
+        assert "/dataflow/all/DSD_RDS_GERD@DF_GERD_SOF/" in second_url
+
+        # Response carried the real sub-agency; overview must surface it
+        # instead of the request-time 'all', otherwise downstream DSD lookups
+        # target the wildcard and fail.
+        assert overview.agency == "OECD.STI.STP"
+        assert overview.dsd_ref is not None
+        assert overview.dsd_ref["agency"] == "OECD.STI.STP"
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_first_attempt_succeeds(self, mock_dataflow_response):
+        """Happy path: 200 on first attempt — no fallback call fired."""
+        client = SDMXProgressiveClient(
+            base_url="https://test.api.org/rest", agency_id="TEST"
+        )
+
+        ok_response = Mock()
+        ok_response.status_code = 200
+        ok_response.content = mock_dataflow_response.encode("utf-8")
+        ok_response.raise_for_status = Mock()
+
+        with patch.object(client, "_get_session") as mock_session:
+            mock_http = AsyncMock()
+            mock_http.get.return_value = ok_response
+            mock_session.return_value = mock_http
+
+            await client.get_dataflow_overview("TEST_DF")
+
+        assert mock_http.get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_agency_already_all(self, mock_dataflow_response):
+        """If the caller explicitly asked for agency='all' and the provider
+        still 404s, we don't loop. The 404 propagates."""
+        client = SDMXProgressiveClient(
+            base_url="https://test.api.org/rest", agency_id="TEST"
+        )
+
+        not_found_response = Mock()
+        not_found_response.status_code = 404
+        not_found_response.raise_for_status = Mock(
+            side_effect=httpx.HTTPStatusError(
+                "404", request=Mock(), response=Mock(status_code=404)
+            )
+        )
+
+        with patch.object(client, "_get_session") as mock_session:
+            mock_http = AsyncMock()
+            mock_http.get.return_value = not_found_response
+            mock_session.return_value = mock_http
+
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.get_dataflow_overview(
+                    "GHOST_DF", agency_id="all"
+                )
+
+        assert mock_http.get.call_count == 1
+
+    @pytest.fixture
+    def mock_dataflow_response(self):
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<str:Structure xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"
+               xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">
+    <str:Structures>
+        <str:Dataflows>
+            <str:Dataflow id="TEST_DF" agencyID="TEST" version="1.0">
+                <com:Name>Test Dataflow</com:Name>
+            </str:Dataflow>
+        </str:Dataflows>
+    </str:Structures>
+</str:Structure>"""
+
+
 class TestClientConfiguration:
     """Test client configuration handling."""
 
@@ -348,3 +491,264 @@ class TestClientConfiguration:
         """Test agency ID can be overridden."""
         client = SDMXProgressiveClient(base_url="https://api.org/rest", agency_id="CUSTOM_AGENCY")
         assert client.agency_id == "CUSTOM_AGENCY"
+
+
+class TestAuthHeaders:
+    """Subscription-key header injection for keyed endpoints (e.g. STATSNZ)."""
+
+    def test_no_endpoint_key_returns_empty(self):
+        client = SDMXProgressiveClient(base_url="https://api.org/rest", agency_id="X")
+        assert client._build_auth_headers() == {}
+
+    def test_endpoint_without_auth_returns_empty(self):
+        client = SDMXProgressiveClient(
+            base_url="https://stats-sdmx-disseminate.pacificdata.org/rest",
+            agency_id="SPC",
+            endpoint_key="SPC",
+        )
+        assert client._build_auth_headers() == {}
+
+    def test_keyed_endpoint_with_env_var_set(self, monkeypatch):
+        monkeypatch.setenv("SDMX_STATSNZ_KEY", "test-key-abc123")
+        client = SDMXProgressiveClient(
+            base_url="https://api.data.stats.govt.nz/rest",
+            agency_id="STATSNZ",
+            endpoint_key="STATSNZ",
+        )
+        headers = client._build_auth_headers()
+        assert headers == {"Ocp-Apim-Subscription-Key": "test-key-abc123"}
+
+    def test_keyed_endpoint_without_env_var_warns_and_returns_empty(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.delenv("SDMX_STATSNZ_KEY", raising=False)
+        client = SDMXProgressiveClient(
+            base_url="https://api.data.stats.govt.nz/rest",
+            agency_id="STATSNZ",
+            endpoint_key="STATSNZ",
+        )
+        with caplog.at_level("WARNING"):
+            headers = client._build_auth_headers()
+        assert headers == {}
+        assert any(
+            "SDMX_STATSNZ_KEY" in rec.message and rec.levelname == "WARNING"
+            for rec in caplog.records
+        )
+
+    def test_unknown_endpoint_key_returns_empty(self):
+        client = SDMXProgressiveClient(
+            base_url="https://api.org/rest",
+            agency_id="X",
+            endpoint_key="NOT_A_REAL_ENDPOINT",
+        )
+        assert client._build_auth_headers() == {}
+
+    @pytest.mark.asyncio
+    async def test_session_carries_auth_header_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("SDMX_STATSNZ_KEY", "live-key-xyz")
+        client = SDMXProgressiveClient(
+            base_url="https://api.data.stats.govt.nz/rest",
+            agency_id="STATSNZ",
+            endpoint_key="STATSNZ",
+        )
+        session = await client._get_session()
+        try:
+            assert session.headers.get("Ocp-Apim-Subscription-Key") == "live-key-xyz"
+        finally:
+            await session.aclose()
+
+    @pytest.mark.asyncio
+    async def test_session_has_no_auth_header_for_non_keyed_endpoint(self):
+        client = SDMXProgressiveClient(
+            base_url="https://stats-sdmx-disseminate.pacificdata.org/rest",
+            agency_id="SPC",
+            endpoint_key="SPC",
+        )
+        session = await client._get_session()
+        try:
+            assert "Ocp-Apim-Subscription-Key" not in session.headers
+        finally:
+            await session.aclose()
+
+    def test_default_query_params_empty_for_non_statsnz(self):
+        client = SDMXProgressiveClient(
+            base_url="https://stats-sdmx-disseminate.pacificdata.org/rest",
+            agency_id="SPC",
+            endpoint_key="SPC",
+        )
+        assert client._build_default_query_params() == {}
+
+    def test_default_query_params_for_statsnz_forces_xml(self):
+        client = SDMXProgressiveClient(
+            base_url="https://api.data.stats.govt.nz/rest",
+            agency_id="STATSNZ",
+            endpoint_key="STATSNZ",
+        )
+        assert client._build_default_query_params() == {"format": "xml"}
+
+
+class TestDataflowCache:
+    """Tests for the module-level dataflow listing cache on discover_dataflows().
+
+    The cache is shared process-wide (not per-client), so every test here
+    uses its own base_url and/or agency to get a private cache key -- on top
+    of the autouse tests/conftest.py fixture that clears the cache between
+    tests.
+    """
+
+    @staticmethod
+    def _xml_response(count: int = 2) -> str:
+        flows = "".join(
+            '<str:Dataflow id="DF_' + str(i) + '" agencyID="TEST" version="1.0" '
+            'isFinal="true"><com:Name>Dataflow ' + str(i) + "</com:Name>"
+            "<com:Description>Desc " + str(i) + "</com:Description></str:Dataflow>"
+            for i in range(count)
+        )
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<str:Structure xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure" '
+            'xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">'
+            "<str:Structures><str:Dataflows>" + flows + "</str:Dataflows></str:Structures>"
+            "</str:Structure>"
+        )
+
+    def _patched_session(self, client: SDMXProgressiveClient, xml: str) -> AsyncMock:
+        """Replace client._get_session with a fake that answers with `xml`
+        every time; returns the fake HTTP client so tests can assert on
+        `.get.call_count`."""
+        mock_response = Mock()
+        mock_response.content = xml.encode("utf-8")
+        mock_response.raise_for_status = Mock()
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=mock_response)
+        client._get_session = AsyncMock(return_value=mock_http)
+        return mock_http
+
+    @pytest.mark.asyncio
+    async def test_second_call_within_ttl_serves_from_cache(self):
+        client = SDMXProgressiveClient(base_url="https://cache1.example/rest", agency_id="AG1")
+        mock_http = self._patched_session(client, self._xml_response(2))
+
+        first = await client.discover_dataflows()
+        assert len(first) == 2
+        assert client.last_dataflow_cache_hit is False
+        assert mock_http.get.call_count == 1
+
+        second = await client.discover_dataflows()
+        assert second == first
+        assert client.last_dataflow_cache_hit is True
+        assert client.last_dataflow_cache_age_s is not None
+        assert mock_http.get.call_count == 1  # not refetched
+
+    @pytest.mark.asyncio
+    async def test_call_after_ttl_refetches(self, monkeypatch):
+        monkeypatch.setattr(sdmx_client_module, "DATAFLOW_CACHE_TTL_S", 0.01)
+
+        client = SDMXProgressiveClient(base_url="https://cache2.example/rest", agency_id="AG1")
+        mock_http = self._patched_session(client, self._xml_response(1))
+
+        await client.discover_dataflows()
+        assert mock_http.get.call_count == 1
+
+        await asyncio.sleep(0.03)
+
+        await client.discover_dataflows()
+        assert mock_http.get.call_count == 2
+        assert client.last_dataflow_cache_hit is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_forces_refetch_and_updates_cache(self):
+        client = SDMXProgressiveClient(base_url="https://cache3.example/rest", agency_id="AG1")
+        mock_http = self._patched_session(client, self._xml_response(1))
+
+        await client.discover_dataflows()
+        assert mock_http.get.call_count == 1
+
+        await client.discover_dataflows(fresh=True)
+        assert mock_http.get.call_count == 2
+        assert client.last_dataflow_cache_hit is False
+
+        # A normal call afterward reuses the entry fresh=True just warmed,
+        # rather than triggering a third fetch.
+        await client.discover_dataflows()
+        assert mock_http.get.call_count == 2
+        assert client.last_dataflow_cache_hit is True
+
+    @pytest.mark.asyncio
+    async def test_cache_key_distinguishes_agencies(self):
+        client = SDMXProgressiveClient(base_url="https://cache4.example/rest", agency_id="AG1")
+        mock_http = self._patched_session(client, self._xml_response(1))
+
+        await client.discover_dataflows(agency_id="AGENCY_A")
+        await client.discover_dataflows(agency_id="AGENCY_B")
+
+        assert mock_http.get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cache_key_distinguishes_base_urls(self):
+        client_a = SDMXProgressiveClient(base_url="https://cache5a.example/rest", agency_id="AG1")
+        client_b = SDMXProgressiveClient(base_url="https://cache5b.example/rest", agency_id="AG1")
+        mock_http_a = self._patched_session(client_a, self._xml_response(1))
+        mock_http_b = self._patched_session(client_b, self._xml_response(1))
+
+        await client_a.discover_dataflows()
+        await client_b.discover_dataflows()
+
+        assert mock_http_a.get.call_count == 1
+        assert mock_http_b.get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_eviction_holds_the_bound(self):
+        client = SDMXProgressiveClient(base_url="https://cache6.example/rest", agency_id="AG1")
+        self._patched_session(client, self._xml_response(1))
+
+        for i in range(sdmx_client_module.DATAFLOW_CACHE_MAX_ENTRIES + 5):
+            await client.discover_dataflows(agency_id="AGENCY_" + str(i))
+
+        assert (
+            len(sdmx_client_module._dataflow_cache)
+            == sdmx_client_module.DATAFLOW_CACHE_MAX_ENTRIES
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_for_same_key_fetch_once(self):
+        client = SDMXProgressiveClient(base_url="https://cache7.example/rest", agency_id="AG1")
+
+        mock_response = Mock()
+        mock_response.content = self._xml_response(1).encode("utf-8")
+        mock_response.raise_for_status = Mock()
+
+        async def slow_get(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return mock_response
+
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(side_effect=slow_get)
+        client._get_session = AsyncMock(return_value=mock_http)
+
+        results = await asyncio.gather(
+            client.discover_dataflows(), client.discover_dataflows()
+        )
+        assert mock_http.get.call_count == 1
+        assert results[0] == results[1]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_fetch_is_not_cached(self):
+        client = SDMXProgressiveClient(base_url="https://cache8.example/rest", agency_id="AG1")
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(side_effect=RuntimeError("boom"))
+        client._get_session = AsyncMock(return_value=mock_http)
+
+        with pytest.raises(RuntimeError):
+            await client.discover_dataflows()
+
+        self._patched_session(client, self._xml_response(1))
+        result = await client.discover_dataflows()
+        assert len(result) == 1
+
+    def test_clear_dataflow_cache_empties_state(self):
+        sdmx_client_module._dataflow_cache[("x",)] = (0.0, [])
+        sdmx_client_module._dataflow_cache_locks[("x",)] = asyncio.Lock()
+        clear_dataflow_cache()
+        assert sdmx_client_module._dataflow_cache == {}
+        assert sdmx_client_module._dataflow_cache_locks == {}

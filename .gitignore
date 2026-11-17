@@ -8,3 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment variables (never commit real secrets)
+.env
+.env.*
+!.env.example
+
+# Tool artifacts
+.codex
+
+# Monitor service data
+monitor/data/
+.coverage

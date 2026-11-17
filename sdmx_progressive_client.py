@@ -7,17 +7,20 @@ This client provides a layered approach to SDMX metadata discovery:
 3. Detailed drill-down (specific codelists, constraints)
 """
 
+import asyncio
 import logging
+import os
+import time
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-
 import httpx
 from mcp.server.fastmcp import Context
 
-from config import SDMX_AGENCY_ID, SDMX_BASE_URL
+from config import SDMX_AGENCY_ID, SDMX_BASE_URL, SDMX_ENDPOINTS
 from models.sdmx_types import (
     AttributeInfo,
     MaintainableRef,
@@ -25,6 +28,86 @@ from models.sdmx_types import (
 from utils import SDMX_NAMESPACES
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Dataflow listing cache
+# =============================================================================
+#
+# SDMX 2.1 has no server-side pagination, so a full dataflow listing can be
+# tens of megabytes and take tens of seconds (ESTAT: ~37 MB, 46-50s in
+# production). This cache is module-level -- shared by every session's
+# client, not owned by any one instance -- because each MCP session builds
+# its own SDMXProgressiveClient, so a per-instance cache would never help a
+# second session or a dashboard making its own independent calls.
+
+DATAFLOW_CACHE_MAX_ENTRIES = 32
+DATAFLOW_CACHE_TTL_S = float(os.getenv("DATAFLOW_CACHE_TTL_S", "900"))
+
+_DataflowCacheKey = tuple[str, str, str, str, str, str]
+
+# key -> (fetched_at monotonic timestamp, parsed dataflow list)
+_dataflow_cache: "OrderedDict[_DataflowCacheKey, tuple[float, list[dict[str, Any]]]]" = (
+    OrderedDict()
+)
+# key -> lock guarding that key's fetch, so concurrent callers for the same
+# key don't all hit the provider at once. Created lazily; removed only by
+# clear_dataflow_cache().
+_dataflow_cache_locks: dict[_DataflowCacheKey, asyncio.Lock] = {}
+
+
+def clear_dataflow_cache() -> None:
+    """Clear the module-level dataflow listing cache and its locks.
+
+    The cache is process-wide, so state left behind by one test decides
+    whether the next test's call reaches the network or not. Call this from
+    an autouse fixture between tests (see tests/conftest.py).
+    """
+    _dataflow_cache.clear()
+    _dataflow_cache_locks.clear()
+
+
+def _dataflow_cache_key(
+    base_url: str, agency: str, resource_id: str, version: str, references: str, detail: str
+) -> _DataflowCacheKey:
+    return (base_url, agency, resource_id, version, references, detail)
+
+
+def _dataflow_cache_lookup(
+    key: _DataflowCacheKey,
+) -> tuple[float, list[dict[str, Any]]] | None:
+    """Return (age_s, dataflows) for a live cache entry, or None on a miss
+    or an expired entry."""
+    entry = _dataflow_cache.get(key)
+    if entry is None:
+        return None
+    fetched_at, dataflows = entry
+    age_s = time.monotonic() - fetched_at
+    if age_s >= DATAFLOW_CACHE_TTL_S:
+        return None
+    return age_s, dataflows
+
+
+def _dataflow_cache_store(key: _DataflowCacheKey, dataflows: list[dict[str, Any]]) -> None:
+    is_new_key = key not in _dataflow_cache
+    _dataflow_cache[key] = (time.monotonic(), dataflows)
+    if is_new_key:
+        while len(_dataflow_cache) > DATAFLOW_CACHE_MAX_ENTRIES:
+            _dataflow_cache.popitem(last=False)  # evict oldest
+
+
+def _dataflow_cache_lock(key: _DataflowCacheKey) -> asyncio.Lock:
+    """Get or create the per-key lock.
+
+    Safe under cooperative concurrency: there is no `await` between the
+    membership check and the insert, so two callers can never race into
+    creating two different locks for the same key.
+    """
+    lock = _dataflow_cache_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _dataflow_cache_locks[key] = lock
+    return lock
 
 
 class DetailLevel(Enum):
@@ -115,6 +198,8 @@ class SDMXProgressiveClient:
     session: httpx.AsyncClient | None
     _cache: dict[str, Any]
     version_cache: dict[tuple[str, str], str]
+    last_dataflow_cache_hit: bool
+    last_dataflow_cache_age_s: float | None
 
     def __init__(
         self,
@@ -122,14 +207,33 @@ class SDMXProgressiveClient:
         agency_id: str | None = None,
         endpoint_key: str | None = None,
     ):
+        # When kwargs are None, fall back to the startup-time module globals.
+        # These are immutable after import (config.set_endpoint was removed),
+        # so every bare construction in this process shares the same value
+        # with no cross-session contamination risk. The session pool always
+        # passes explicit kwargs anyway; the defaults are a convenience for
+        # direct-call tests.
         self.base_url = (base_url or SDMX_BASE_URL).rstrip("/")
         self.agency_id = agency_id or SDMX_AGENCY_ID
         self.endpoint_key = endpoint_key
         self.session = None
-        self._cache = {}  # Simple cache for repeated requests
+        # Per-instance caches. Under the session-pool model each (session,
+        # endpoint) owns one client, and async tool handlers don't yield
+        # between cache-miss and cache-write for the same key, so the
+        # read-then-write pattern is effectively single-flight per client.
+        # If future code introduces a genuine compute-then-cache pattern
+        # across an await boundary, or if a client instance is ever shared
+        # across threads, add an instance-level Lock guarding these dicts.
+        # (Audit L2.)
+        self._cache = {}
         # Cache for dataflow versions to avoid repeated lookups
         # Format: {(agency_id, dataflow_id): version}
         self.version_cache = {}
+        # Cache status of the most recent discover_dataflows() call on this
+        # client, so tools.sdmx_tools.list_dataflows can report it. The
+        # cache backing this is module-level (see above), not per-instance.
+        self.last_dataflow_cache_hit = False
+        self.last_dataflow_cache_age_s = None
 
     async def _get_session(self) -> httpx.AsyncClient:
         """Get or create HTTP session with proper SSL certificate verification."""
@@ -140,17 +244,95 @@ class SDMXProgressiveClient:
             import ssl
 
             ssl_ctx = ssl.create_default_context()
+            default_headers = self._build_auth_headers()
+            default_params = self._build_default_query_params()
             self.session = httpx.AsyncClient(
                 timeout=30.0,
                 verify=ssl_ctx,
+                headers=default_headers or None,
+                params=default_params or None,
             )
         return self.session
+
+    def _build_default_query_params(self) -> dict[str, str]:
+        """Return per-endpoint query params merged into every request."""
+        if not self.endpoint_key:
+            return {}
+        ep = SDMX_ENDPOINTS.get(self.endpoint_key)
+        if ep is None:
+            return {}
+        params = ep.get("default_query_params")
+        if not params:
+            return {}
+        return dict(params)
+
+    def _build_auth_headers(self) -> dict[str, str]:
+        """Return subscription-key headers for endpoints that require them."""
+        if not self.endpoint_key:
+            return {}
+        ep = SDMX_ENDPOINTS.get(self.endpoint_key)
+        if ep is None:
+            return {}
+        auth = ep.get("auth")
+        if not auth:
+            return {}
+        header_name = auth.get("header")
+        env_name = auth.get("env")
+        if not header_name or not env_name:
+            return {}
+        key = os.getenv(env_name)
+        if not key:
+            logger.warning(
+                "Endpoint %s requires header %s but env var %s is unset; "
+                "requests will fail with 401",
+                self.endpoint_key,
+                header_name,
+                env_name,
+            )
+            return {}
+        return {header_name: key}
 
     async def close(self):
         """Close HTTP session."""
         if self.session:
             await self.session.aclose()
             self.session = None
+
+    async def fetch_data_probe(
+        self,
+        data_url: str,
+        accept: str = "application/vnd.sdmx.data+csv;version=1.0.0",
+        timeout: float = 30.0,
+    ) -> tuple[int, str]:
+        """Fetch data from an SDMX data URL for probing.
+
+        Returns (status_code, response_text), or (0, "") on transport error.
+
+        A 406 against an SDMx-CSV Accept is retried once as `text/csv`:
+        ECB never implemented the standard type and answers 406, while
+        serving the same data happily as plain CSV. Retrying by observed
+        behaviour rather than by provider name means any provider with the
+        same divergence is handled without a config change.
+        """
+        session = await self._get_session()
+        try:
+            response = await session.get(
+                data_url,
+                headers={"Accept": accept, "Accept-Language": "en"},
+                timeout=timeout,
+            )
+            if response.status_code == 406 and "vnd.sdmx" in accept and "csv" in accept:
+                logger.info(
+                    "%s rejected %s; retrying as text/csv", self.endpoint_key, accept
+                )
+                response = await session.get(
+                    data_url,
+                    headers={"Accept": "text/csv", "Accept-Language": "en"},
+                    timeout=timeout,
+                )
+            return response.status_code, response.text
+        except Exception:
+            return 0, ""
 
     async def resolve_version(
         self,
@@ -185,12 +367,12 @@ class SDMXProgressiveClient:
         # Check cache first
         if cache_key in self.version_cache:
             if ctx:
-                ctx.info(f"Using cached version for {dataflow_id}: {self.version_cache[cache_key]}")
+                await ctx.info(f"Using cached version for {dataflow_id}: {self.version_cache[cache_key]}")
             return self.version_cache[cache_key]
 
         # Fetch the actual version
         if ctx:
-            ctx.info(f"Resolving 'latest' version for {dataflow_id}...")
+            await ctx.info(f"Resolving 'latest' version for {dataflow_id}...")
 
         session = await self._get_session()
         url = f"{self.base_url}/dataflow/{agency_id}/{dataflow_id}/latest"
@@ -211,13 +393,13 @@ class SDMXProgressiveClient:
                     break
 
             if not actual_version:
-                raise ValueError(f"Could not extract version from dataflow response")
+                raise ValueError("Could not extract version from dataflow response")
 
             # Cache the result
             self.version_cache[cache_key] = actual_version
 
             if ctx:
-                ctx.info(f"Resolved 'latest' to version {actual_version}")
+                await ctx.info(f"Resolved 'latest' to version {actual_version}")
 
             return actual_version
 
@@ -236,8 +418,41 @@ class SDMXProgressiveClient:
         """
         Get lightweight dataflow overview without references.
         This is the first level of discovery.
+
+        On a 404 we retry once with `agency="all"` — the SDMX 2.1 REST
+        wildcard documented for the `agencies` path parameter. Providers
+        that publish flows under sub-agencies (notably OECD, where a flow
+        like `DSD_RDS_GERD@DF_GERD_SOF` is owned by `OECD.STI.STP`)
+        resolve under the wildcard without the caller knowing the
+        sub-agency upfront. The real agency is recovered from the
+        `agencyID` attribute on the returned `<structure:Dataflow>`
+        element, so downstream DSD lookups still target the correct owner.
         """
         agency = agency_id or self.agency_id
+        try:
+            return await self._fetch_dataflow_overview_once(
+                dataflow_id, agency, version, ctx
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404 and agency != "all":
+                logger.info(
+                    "Dataflow %s not found on agency '%s'; retrying with wildcard 'all'.",
+                    dataflow_id,
+                    agency,
+                )
+                return await self._fetch_dataflow_overview_once(
+                    dataflow_id, "all", version, ctx
+                )
+            raise
+
+    async def _fetch_dataflow_overview_once(
+        self,
+        dataflow_id: str,
+        agency: str,
+        version: str,
+        ctx: Context[Any, Any, Any] | None,
+    ) -> DataflowOverview:
+        """Single-attempt fetch + parse for a dataflow overview."""
         cache_key = f"df_overview_{agency}_{dataflow_id}_{version}"
 
         if cache_key in self._cache:
@@ -246,7 +461,7 @@ class SDMXProgressiveClient:
         url = f"{self.base_url}/dataflow/{agency}/{dataflow_id}/{version}?references=none"
 
         if ctx:
-            ctx.info(f"Getting dataflow overview for {dataflow_id}...")
+            await ctx.info(f"Getting dataflow overview for {dataflow_id}...")
 
         try:
             session = await self._get_session()
@@ -291,6 +506,8 @@ class SDMXProgressiveClient:
 
             raise ValueError(f"No dataflow element found for {dataflow_id}")
 
+        except httpx.HTTPStatusError:
+            raise
         except Exception as e:
             logger.error(f"Failed to get dataflow overview: {e}")
             raise
@@ -325,7 +542,7 @@ class SDMXProgressiveClient:
         dsd_url = f"{self.base_url}/datastructure/{overview.dsd_ref['agency']}/{overview.dsd_ref['id']}/{overview.dsd_ref['version']}?references=children&detail=full"
 
         if ctx:
-            ctx.info(f"Getting structure summary for {overview.dsd_ref['id']}...")
+            await ctx.info(f"Getting structure summary for {overview.dsd_ref['id']}...")
 
         try:
             session = await self._get_session()
@@ -520,7 +737,7 @@ class SDMXProgressiveClient:
         cl_url = f"{self.base_url}/codelist/{cl_ref['agency']}/{cl_ref['id']}/{cl_ref['version']}"
 
         if ctx:
-            ctx.info(f"Fetching codes for dimension {dimension_id} from codelist {cl_ref['id']}...")
+            await ctx.info(f"Fetching codes for dimension {dimension_id} from codelist {cl_ref['id']}...")
 
         try:
             session = await self._get_session()
@@ -572,106 +789,146 @@ class SDMXProgressiveClient:
         references: str = "none",
         detail: str = "full",
         ctx: Context[Any, Any, Any] | None = None,
+        fresh: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Discover available dataflows using SDMX 2.1 REST API.
 
         Endpoint: GET /dataflow/{agencyID}/{resourceID}/{version}
+
+        Results are cached at module level (see "Dataflow listing cache"
+        above), keyed on everything that changes the answer: base URL,
+        agency, resource_id, version, references, and detail. Pass
+        fresh=True to bypass the cache lookup and force a live re-fetch; the
+        result is still written back to the cache afterwards, so a forced
+        call also warms it for every other caller.
+
+        After the call, `self.last_dataflow_cache_hit` and
+        `self.last_dataflow_cache_age_s` describe how *this* call was
+        served, so tools.sdmx_tools.list_dataflows can report cache status.
         """
-        if ctx:
-            ctx.info("Starting dataflow discovery...")
-            await ctx.report_progress(0, 100)
-
         agency = agency_id or self.agency_id
-        url = f"{self.base_url}/dataflow/{agency}/{resource_id}/{version}"
+        key = _dataflow_cache_key(self.base_url, agency, resource_id, version, references, detail)
 
-        headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
+        if not fresh:
+            hit = _dataflow_cache_lookup(key)
+            if hit is not None:
+                age_s, dataflows = hit
+                self.last_dataflow_cache_hit = True
+                self.last_dataflow_cache_age_s = age_s
+                if ctx:
+                    await ctx.info(f"Using cached dataflow listing ({age_s:.0f}s old)")
+                return dataflows
 
-        params: list[str] = []
-        if references != "none":
-            params.append(f"references={references}")
-        if detail != "full":
-            params.append(f"detail={detail}")
+        async with _dataflow_cache_lock(key):
+            # Re-check inside the lock: another caller may have populated
+            # this key while we were waiting for it. fresh=True always
+            # re-fetches, but still serializes on the lock so it can't
+            # interleave with another writer for the same key.
+            if not fresh:
+                hit = _dataflow_cache_lookup(key)
+                if hit is not None:
+                    age_s, dataflows = hit
+                    self.last_dataflow_cache_hit = True
+                    self.last_dataflow_cache_age_s = age_s
+                    return dataflows
 
-        if params:
-            url += "?" + "&".join(params)
-
-        try:
             if ctx:
-                ctx.info(f"Fetching dataflows from: {url}")
-                await ctx.report_progress(25, 100)
+                await ctx.info("Starting dataflow discovery...")
+                await ctx.report_progress(0, 100)
 
-            session = await self._get_session()
-            response = await session.get(url, headers=headers)
-            response.raise_for_status()
+            url = f"{self.base_url}/dataflow/{agency}/{resource_id}/{version}"
 
-            if ctx:
-                ctx.info("Parsing SDMX-ML response...")
-                await ctx.report_progress(50, 100)
+            headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
 
-            # Parse SDMX-ML response
-            root = ET.fromstring(response.content)
+            params: list[str] = []
+            if references != "none":
+                params.append(f"references={references}")
+            if detail != "full":
+                params.append(f"detail={detail}")
 
-            dataflows: list[dict[str, Any]] = []
-            df_elements = root.findall(".//str:Dataflow", SDMX_NAMESPACES)
+            if params:
+                url += "?" + "&".join(params)
 
-            if ctx and df_elements:
-                ctx.info(f"Processing {len(df_elements)} dataflows...")
+            try:
+                if ctx:
+                    await ctx.info(f"Fetching dataflows from: {url}")
+                    await ctx.report_progress(25, 100)
 
-            for i, df in enumerate(df_elements):
-                df_id = df.get("id")
-                df_agency = df.get("agencyID", agency)
-                df_version = df.get("version", "latest")
-                is_final = df.get("isFinal", "false").lower() == "true"
-
-                # Extract name and description
-                name_elem = df.find("./com:Name", SDMX_NAMESPACES)
-                desc_elem = df.find("./com:Description", SDMX_NAMESPACES)
-
-                name = name_elem.text if name_elem is not None else df_id
-                description = desc_elem.text if desc_elem is not None else ""
-
-                # Extract structure reference if available
-                structure_ref = None
-                struct_elem = df.find("./str:Structure", SDMX_NAMESPACES)
-                if struct_elem is not None:
-                    struct_ref = struct_elem.find("./com:Ref", SDMX_NAMESPACES)
-                    if struct_ref is not None:
-                        structure_ref = {
-                            "id": struct_ref.get("id"),
-                            "agency": struct_ref.get("agencyID", df_agency),
-                            "version": struct_ref.get("version", df_version),
-                        }
-
-                dataflow_info = {
-                    "id": df_id,
-                    "agency": df_agency,
-                    "version": df_version,
-                    "name": name,
-                    "description": description,
-                    "is_final": is_final,
-                    "structure_reference": structure_ref,
-                    "data_url_template": f"{self.base_url}/data/{df_agency},{df_id},{df_version}/{{key}}/{{provider}}",
-                    "metadata_url": f"{self.base_url}/dataflow/{df_agency}/{df_id}/{df_version}",
-                }
-
-                dataflows.append(dataflow_info)
+                session = await self._get_session()
+                response = await session.get(url, headers=headers)
+                response.raise_for_status()
 
                 if ctx:
-                    progress = 50 + ((i + 1) * 40 // len(df_elements))
-                    await ctx.report_progress(progress, 100)
+                    await ctx.info("Parsing SDMX-ML response...")
+                    await ctx.report_progress(50, 100)
 
-            if ctx:
-                ctx.info(f"Successfully discovered {len(dataflows)} dataflows")
-                await ctx.report_progress(100, 100)
+                # Parse SDMX-ML response
+                root = ET.fromstring(response.content)
 
-            return dataflows
+                dataflows: list[dict[str, Any]] = []
+                df_elements = root.findall(".//str:Dataflow", SDMX_NAMESPACES)
 
-        except Exception as e:
-            if ctx:
-                ctx.info(f"Error discovering dataflows: {str(e)}")
-            logger.exception("Failed to discover dataflows")
-            raise
+                if ctx and df_elements:
+                    await ctx.info(f"Processing {len(df_elements)} dataflows...")
+
+                for i, df in enumerate(df_elements):
+                    df_id = df.get("id")
+                    df_agency = df.get("agencyID", agency)
+                    df_version = df.get("version", "latest")
+                    is_final = df.get("isFinal", "false").lower() == "true"
+
+                    # Extract name and description
+                    name_elem = df.find("./com:Name", SDMX_NAMESPACES)
+                    desc_elem = df.find("./com:Description", SDMX_NAMESPACES)
+
+                    name = name_elem.text if name_elem is not None else df_id
+                    description = desc_elem.text if desc_elem is not None else ""
+
+                    # Extract structure reference if available
+                    structure_ref = None
+                    struct_elem = df.find("./str:Structure", SDMX_NAMESPACES)
+                    if struct_elem is not None:
+                        struct_ref = struct_elem.find("./com:Ref", SDMX_NAMESPACES)
+                        if struct_ref is not None:
+                            structure_ref = {
+                                "id": struct_ref.get("id"),
+                                "agency": struct_ref.get("agencyID", df_agency),
+                                "version": struct_ref.get("version", df_version),
+                            }
+
+                    dataflow_info = {
+                        "id": df_id,
+                        "agency": df_agency,
+                        "version": df_version,
+                        "name": name,
+                        "description": description,
+                        "is_final": is_final,
+                        "structure_reference": structure_ref,
+                        "data_url_template": f"{self.base_url}/data/{df_agency},{df_id},{df_version}/{{key}}/{{provider}}",
+                        "metadata_url": f"{self.base_url}/dataflow/{df_agency}/{df_id}/{df_version}",
+                    }
+
+                    dataflows.append(dataflow_info)
+
+                    if ctx:
+                        progress = 50 + ((i + 1) * 40 // len(df_elements))
+                        await ctx.report_progress(progress, 100)
+
+                if ctx:
+                    await ctx.info(f"Successfully discovered {len(dataflows)} dataflows")
+                    await ctx.report_progress(100, 100)
+
+                _dataflow_cache_store(key, dataflows)
+                self.last_dataflow_cache_hit = False
+                self.last_dataflow_cache_age_s = None
+                return dataflows
+
+            except Exception as e:
+                if ctx:
+                    await ctx.info(f"Error discovering dataflows: {str(e)}")
+                logger.exception("Failed to discover dataflows")
+                raise
 
     def _get_fallback_agencies(self, primary_agency: str) -> list[str]:
         """Fallback agencies for codelist lookup when primary agency returns 404/204."""
@@ -708,7 +965,7 @@ class SDMXProgressiveClient:
             Dict containing codelist metadata and codes
         """
         if ctx:
-            ctx.info(f"Retrieving codelist {codelist_id}...")
+            await ctx.info(f"Retrieving codelist {codelist_id}...")
 
         agency = agency_id or self.agency_id
 
@@ -802,7 +1059,7 @@ class SDMXProgressiveClient:
 
             if ctx:
                 await ctx.report_progress(100, 100)
-                ctx.info(f"Retrieved {len(codes)} codes from codelist")
+                await ctx.info(f"Retrieved {len(codes)} codes from codelist")
 
             return {
                 "codelist_id": cl_id,
@@ -817,12 +1074,12 @@ class SDMXProgressiveClient:
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP error {e.response.status_code}: {e.response.text[:200]}"
             if ctx:
-                ctx.info(f"Error retrieving codelist: {error_msg}")
+                await ctx.info(f"Error retrieving codelist: {error_msg}")
             logger.error(f"Failed to get codelist {codelist_id}: {error_msg}")
             return {"codelist_id": codelist_id, "error": error_msg, "codes": []}
         except Exception as e:
             if ctx:
-                ctx.info(f"Error retrieving codelist: {str(e)}")
+                await ctx.info(f"Error retrieving codelist: {str(e)}")
             logger.exception(f"Failed to get codelist {codelist_id}")
             return {"codelist_id": codelist_id, "error": str(e), "codes": []}
 
@@ -834,8 +1091,17 @@ class SDMXProgressiveClient:
         ctx: Context[Any, Any, Any] | None = None,
     ) -> dict[str, Any]:
         """
-        Get actual data availability from ContentConstraint.
-        This shows what data actually exists vs what's theoretically possible.
+        Get data availability from ContentConstraint, preferring Actual over Allowed.
+
+        Two constraint types exist and carry different meanings. Actual means
+        codes confirmed to hold data: the provider is asserting that queries
+        using those codes will return observations. Allowed means codes the
+        schema permits, which may be far broader than what has data; some
+        providers (ECB among them) publish only Allowed constraints and never
+        an Actual one. When only Allowed is available this method falls back
+        to it rather than reporting nothing, but the caller must not read an
+        Allowed result as confirmation that data exists. It means only that
+        the query is well-formed, not that it will return observations.
         """
         from config import get_best_references
 
@@ -847,6 +1113,7 @@ class SDMXProgressiveClient:
             return {
                 "dataflow_id": dataflow_id,
                 "has_constraint": False,
+                "constraint_type": None,
                 "note": "Endpoint does not support constraint references",
             }
 
@@ -857,7 +1124,7 @@ class SDMXProgressiveClient:
         )
 
         if ctx:
-            ctx.info("Checking actual data availability for " + dataflow_id + "...")
+            await ctx.info("Checking actual data availability for " + dataflow_id + "...")
 
         try:
             session = await self._get_session()
@@ -868,19 +1135,26 @@ class SDMXProgressiveClient:
 
             root = ET.fromstring(response.content)
 
-            # Find ContentConstraint with type="Actual"
-            actual_constraint = None
-            for constraint in root.findall(
-                './/str:ContentConstraint[@type="Actual"]', SDMX_NAMESPACES
-            ):
-                actual_constraint = constraint
-                break
+            # Prefer an Actual constraint (codes confirmed to hold data). Fall
+            # back to Allowed (codes the schema permits, possibly far broader):
+            # ECB publishes only Allowed, and reporting nothing at all hides
+            # information the provider is giving us.
+            constraint = None
+            constraint_type = None
+            for candidate in root.findall(".//str:ContentConstraint", SDMX_NAMESPACES):
+                kind = candidate.get("type")
+                if kind == "Actual":
+                    constraint, constraint_type = candidate, "Actual"
+                    break
+                if constraint is None and kind == "Allowed":
+                    constraint, constraint_type = candidate, "Allowed"
 
-            if not actual_constraint:
+            if constraint is None:
                 return {
                     "dataflow_id": dataflow_id,
                     "has_constraint": False,
-                    "note": "No actual data availability constraint found",
+                    "constraint_type": None,
+                    "note": "No content constraint published for this dataflow",
                 }
 
             cube_regions: list[dict[str, Any]] = []
@@ -888,7 +1162,7 @@ class SDMXProgressiveClient:
             time_range: dict[str, str] | None = None
 
             # Parse CubeRegions (shows available dimension combinations)
-            for cube_region in actual_constraint.findall(".//str:CubeRegion", SDMX_NAMESPACES):
+            for cube_region in constraint.findall(".//str:CubeRegion", SDMX_NAMESPACES):
                 region_keys: dict[str, list[str]] = {}
 
                 for key_value in cube_region.findall(".//com:KeyValue", SDMX_NAMESPACES):
@@ -920,7 +1194,7 @@ class SDMXProgressiveClient:
                 cube_regions.append(region_info)
 
             # Parse KeySets (alternative representation)
-            for key_set in actual_constraint.findall(".//str:KeySet", SDMX_NAMESPACES):
+            for key_set in constraint.findall(".//str:KeySet", SDMX_NAMESPACES):
                 for key in key_set.findall(".//str:Key", SDMX_NAMESPACES):
                     key_values: dict[str, str] = {}
                     for key_value in key.findall(".//com:KeyValue", SDMX_NAMESPACES):
@@ -929,13 +1203,22 @@ class SDMXProgressiveClient:
                             key_values[key_value.get("id", "")] = value_elem.text
                     key_sets.append(key_values)
 
+            interpretation: list[str] = []
+            if constraint_type == "Allowed":
+                interpretation.append(
+                    "Note: Allowed constraint (codes permitted by the schema, "
+                    "not confirmed to have data)."
+                )
+
             return {
                 "dataflow_id": dataflow_id,
                 "has_constraint": True,
-                "constraint_id": actual_constraint.get("id"),
+                "constraint_id": constraint.get("id"),
+                "constraint_type": constraint_type,
                 "cube_regions": cube_regions,
                 "key_sets": key_sets,
                 "time_range": time_range,
+                "interpretation": interpretation,
             }
 
         except Exception as e:
@@ -1026,7 +1309,7 @@ class SDMXProgressiveClient:
         )
 
         if ctx:
-            ctx.info(f"Fetching {direction} references for {structure_type}/{structure_id}...")
+            await ctx.info(f"Fetching {direction} references for {structure_type}/{structure_id}...")
 
         try:
             session = await self._get_session()
@@ -1090,7 +1373,7 @@ class SDMXProgressiveClient:
                 result["children"] = children
 
             if ctx:
-                ctx.info(f"Found {len(parents)} parents, {len(children)} children")
+                await ctx.info(f"Found {len(parents)} parents, {len(children)} children")
 
             return result
 

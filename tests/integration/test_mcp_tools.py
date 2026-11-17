@@ -68,8 +68,45 @@ class TestListDataflows:
         client = MagicMock(spec=SDMXProgressiveClient)
         client.agency_id = "SPC"
         client.endpoint_key = "SPC"
+        client.base_url = "https://stats-sdmx-disseminate.pacificdata.org/rest"
         client.discover_dataflows = AsyncMock(return_value=mock_dataflows)
         return client
+
+    @pytest.mark.asyncio
+    async def test_list_dataflows_carries_structure_url(self, mock_client):
+        """Each summary carries the full-structure URL a downstream parser can fetch."""
+        result = await list_dataflows(client=mock_client)
+        urls = {df["id"]: df["structure_url"] for df in result["dataflows"]}
+        assert urls["TRADE_FOOD"] == (
+            "https://stats-sdmx-disseminate.pacificdata.org/rest"
+            "/dataflow/SPC/TRADE_FOOD/latest?references=all"
+        )
+        assert all(u.endswith("?references=all") for u in urls.values())
+
+    @pytest.mark.asyncio
+    async def test_list_dataflows_structure_url_uses_dataflow_agency(self, mock_client):
+        """A sub-agency reported by the provider wins over the endpoint agency."""
+        mock_client.discover_dataflows = AsyncMock(return_value=[
+            {"id": "DSD_TOURISM_INTER@DF_INBOUND", "agency": "OECD.CFE.TOU",
+             "name": "Inbound tourism", "description": ""},
+        ])
+        mock_client.base_url = "https://sdmx.oecd.org/public/rest"
+        result = await list_dataflows(client=mock_client, agency_id="all")
+        assert result["dataflows"][0]["structure_url"] == (
+            "https://sdmx.oecd.org/public/rest/dataflow/OECD.CFE.TOU/"
+            "DSD_TOURISM_INTER@DF_INBOUND/latest?references=all"
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_dataflows_without_base_url_still_answers(self, mock_dataflows):
+        """A client with no base_url (older mocks, unusual wiring) degrades to None."""
+        client = MagicMock(spec=SDMXProgressiveClient)
+        client.agency_id = "SPC"
+        client.endpoint_key = "SPC"
+        client.discover_dataflows = AsyncMock(return_value=mock_dataflows)
+        result = await list_dataflows(client=client)
+        assert "error" not in result
+        assert result["dataflows"][0]["structure_url"] is None
 
     @pytest.mark.asyncio
     async def test_list_dataflows_no_keywords(self, mock_client, mock_dataflows):
@@ -124,6 +161,43 @@ class TestListDataflows:
         assert result["dataflows"] == []
         assert "Network error" in result["error"]
 
+    @pytest.mark.asyncio
+    async def test_next_step_reports_fresh_fetch_by_default(self, mock_client):
+        """A client that reports no cache hit should read as freshly fetched."""
+        mock_client.last_dataflow_cache_hit = False
+        mock_client.last_dataflow_cache_age_s = None
+
+        result = await list_dataflows(client=mock_client)
+
+        assert "fresh" in result["next_step"].lower()
+
+    @pytest.mark.asyncio
+    async def test_next_step_reports_cache_status_when_served_from_cache(self, mock_client):
+        """A client that reports a cache hit should surface age, so a caller
+        does not have to guess whether the listing is current."""
+        mock_client.last_dataflow_cache_hit = True
+        mock_client.last_dataflow_cache_age_s = 42.0
+
+        result = await list_dataflows(client=mock_client)
+
+        assert "cache" in result["next_step"].lower()
+        assert "42" in result["next_step"]
+
+    @pytest.mark.asyncio
+    async def test_fresh_param_is_passed_through_to_discover_dataflows(self, mock_client):
+        """fresh=True on the tool must reach the client so it bypasses cache."""
+        await list_dataflows(client=mock_client, fresh=True)
+
+        _, kwargs = mock_client.discover_dataflows.call_args
+        assert kwargs.get("fresh") is True
+
+    @pytest.mark.asyncio
+    async def test_fresh_defaults_to_false(self, mock_client):
+        await list_dataflows(client=mock_client)
+
+        _, kwargs = mock_client.discover_dataflows.call_args
+        assert kwargs.get("fresh") is False
+
 
 class TestGetDataflowStructure:
     """Test get_dataflow_structure tool."""
@@ -164,9 +238,19 @@ class TestGetDataflowStructure:
         client = MagicMock(spec=SDMXProgressiveClient)
         client.agency_id = "SPC"
         client.endpoint_key = "SPC"
+        client.base_url = "https://stats-sdmx-disseminate.pacificdata.org/rest"
         client.get_dataflow_overview = AsyncMock(return_value=mock_overview)
         client.get_structure_summary = AsyncMock(return_value=mock_structure)
         return client
+
+    @pytest.mark.asyncio
+    async def test_get_dataflow_structure_carries_structure_url(self, mock_client):
+        """The result names the full-structure URL for the resolved agency and id."""
+        result = await get_dataflow_structure(client=mock_client, dataflow_id="TRADE_FOOD")
+        assert result["structure_url"] == (
+            "https://stats-sdmx-disseminate.pacificdata.org/rest"
+            "/dataflow/SPC/TRADE_FOOD/latest?references=all"
+        )
 
     @pytest.mark.asyncio
     async def test_get_structure_success(self, mock_client):
@@ -433,6 +517,302 @@ class TestBuildSdmxKey:
         assert "key" in result
 
 
+class TestGetDataAvailability:
+    """Test availability queries, including exact availableconstraint support."""
+
+    EXACT_CONSTRAINT_XML = (
+        '<?xml version="1.0"?>'
+        '<mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"'
+        ' xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"'
+        ' xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">'
+        "<mes:Structures><str:Constraints>"
+        '<str:ContentConstraint id="CC" type="Actual">'
+        "<com:Annotations>"
+        '<com:Annotation id="obs_count">'
+        "<com:AnnotationTitle>794</com:AnnotationTitle>"
+        "<com:AnnotationType>sdmx_metrics</com:AnnotationType>"
+        "</com:Annotation>"
+        "</com:Annotations>"
+        '<str:CubeRegion include="true">'
+        '<com:KeyValue id="FREQ"><com:Value>M</com:Value></com:KeyValue>'
+        '<com:KeyValue id="COMMODITY"><com:Value>GOLD</com:Value></com:KeyValue>'
+        '<com:KeyValue id="INDICATOR"><com:Value>COMPRICE</com:Value></com:KeyValue>'
+        '<com:KeyValue id="TIME_PERIOD">'
+        "<com:TimeRange>"
+        '<com:StartPeriod isInclusive="true">1960-01-01T00:00:00</com:StartPeriod>'
+        '<com:EndPeriod isInclusive="true">2026-02-28T00:00:00</com:EndPeriod>'
+        "</com:TimeRange>"
+        "</com:KeyValue>"
+        "</str:CubeRegion>"
+        "</str:ContentConstraint>"
+        "</str:Constraints></mes:Structures></mes:Structure>"
+    )
+
+    EMPTY_SENTINEL_XML = (
+        '<?xml version="1.0"?>'
+        '<mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"'
+        ' xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"'
+        ' xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">'
+        "<mes:Structures><str:Constraints>"
+        '<str:ContentConstraint id="CC" type="Actual">'
+        "<com:Annotations>"
+        '<com:Annotation id="obs_count">'
+        "<com:AnnotationTitle>0</com:AnnotationTitle>"
+        "<com:AnnotationType>sdmx_metrics</com:AnnotationType>"
+        "</com:Annotation>"
+        "</com:Annotations>"
+        '<str:CubeRegion include="true">'
+        '<com:KeyValue id="TIME_PERIOD">'
+        "<com:TimeRange>"
+        '<com:StartPeriod isInclusive="true">9999-01-01T00:00:00</com:StartPeriod>'
+        '<com:EndPeriod isInclusive="true">0001-12-31T23:59:59</com:EndPeriod>'
+        "</com:TimeRange>"
+        "</com:KeyValue>"
+        "</str:CubeRegion>"
+        "</str:ContentConstraint>"
+        "</str:Constraints></mes:Structures></mes:Structure>"
+    )
+
+    @pytest.fixture
+    def mock_structure(self):
+        return DataStructureSummary(
+            id="DSD_COMMODITY_PRICES",
+            agency="SPC",
+            version="1.0",
+            dimensions=[
+                DimensionInfo(id="FREQ", position=1, type="Dimension"),
+                DimensionInfo(id="COMMODITY", position=2, type="Dimension"),
+                DimensionInfo(id="INDICATOR", position=3, type="Dimension"),
+                DimensionInfo(id="TIME_PERIOD", position=4, type="TimeDimension"),
+            ],
+            key_family=["FREQ", "COMMODITY", "INDICATOR"],
+            attributes=[],
+            primary_measure="OBS_VALUE",
+        )
+
+    @pytest.fixture
+    def mock_client(self, mock_structure):
+        client = MagicMock(spec=SDMXProgressiveClient)
+        client.agency_id = "SPC"
+        client.endpoint_key = "SPC"
+        client.base_url = "https://stats-sdmx-disseminate.pacificdata.org/rest"
+        client.get_structure_summary = AsyncMock(return_value=mock_structure)
+        return client
+
+    def _make_response(self, xml_text):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.content = xml_text.encode("utf-8")
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_uses_availableconstraint_exact_with_obs_count(self, mock_client):
+        mock_session = AsyncMock()
+        mock_session.get = AsyncMock(return_value=self._make_response(self.EXACT_CONSTRAINT_XML))
+        mock_client._get_session = AsyncMock(return_value=mock_session)
+
+        result = await get_data_availability(
+            client=mock_client,
+            dataflow_id="DF_COMMODITY_PRICES",
+            filters={"FREQ": "M", "COMMODITY": "GOLD", "INDICATOR": "COMPRICE"},
+        )
+
+        assert result["has_constraint"] is True
+        assert result["data_exists"] is True
+        assert result["observation_count"] == 794
+        assert result["time_range"] == {"start": "1960-01-01", "end": "2026-02-28"}
+        call_url = mock_session.get.call_args[0][0]
+        assert "/availableconstraint/DF_COMMODITY_PRICES/M.GOLD.COMPRICE/all/all" in call_url
+        assert "mode=exact" in call_url
+
+    @pytest.mark.asyncio
+    async def test_empty_sentinel_range_becomes_empty_result(self, mock_client):
+        mock_session = AsyncMock()
+        mock_session.get = AsyncMock(return_value=self._make_response(self.EMPTY_SENTINEL_XML))
+        mock_client._get_session = AsyncMock(return_value=mock_session)
+
+        result = await get_data_availability(
+            client=mock_client,
+            dataflow_id="DF_COMMODITY_PRICES",
+            filters={"FREQ": "M", "COMMODITY": "UNICORNS", "INDICATOR": "COMPRICE"},
+        )
+
+        assert result["has_constraint"] is True
+        assert result["data_exists"] is False
+        assert result["observation_count"] == 0
+        assert result["time_range"] is None
+        assert any("sentinel time range" in line for line in result["interpretation"])
+
+    @pytest.mark.asyncio
+    async def test_constraint_type_is_carried_from_the_response(self, mock_client):
+        """Actual and Allowed share an element name and mean different things:
+        Actual is confirmed data, Allowed is merely schema-permitted. Dropping
+        the distinction makes every availability answer look confirmed."""
+        mock_session = AsyncMock()
+        mock_session.get = AsyncMock(return_value=self._make_response(self.EXACT_CONSTRAINT_XML))
+        mock_client._get_session = AsyncMock(return_value=mock_session)
+
+        result = await get_data_availability(
+            client=mock_client,
+            dataflow_id="DF_COMMODITY_PRICES",
+            filters={"FREQ": "M"},
+        )
+
+        assert result["constraint_type"] == "Actual"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_filter_dimension_is_rejected_not_dropped(self, mock_client):
+        """A filter naming no dimension used to be dropped silently, so the
+        whole-dataflow count came back reported as the filtered one. Against
+        SPC's DF_SDG that turned a request for Fiji into 121140 observations
+        for everything."""
+        mock_session = AsyncMock()
+        mock_session.get = AsyncMock(return_value=self._make_response(self.EXACT_CONSTRAINT_XML))
+        mock_client._get_session = AsyncMock(return_value=mock_session)
+
+        result = await get_data_availability(
+            client=mock_client,
+            dataflow_id="DF_COMMODITY_PRICES",
+            filters={"GEO_PICT": "FJ"},
+        )
+
+        assert "error" in result
+        assert "GEO_PICT" in result["error"]
+        assert result.get("observation_count") is None
+        # The agent needs to know what it may use instead.
+        assert any("COMMODITY" in line for line in result["interpretation"])
+        # And nothing may be fetched, so no count can be mistaken for filtered.
+        mock_session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_known_filter_plus_an_unknown_one_still_errors(self, mock_client):
+        """Partially valid filters are the dangerous case: the query would run
+        and return a real number for the wrong selection."""
+        mock_session = AsyncMock()
+        mock_session.get = AsyncMock(return_value=self._make_response(self.EXACT_CONSTRAINT_XML))
+        mock_client._get_session = AsyncMock(return_value=mock_session)
+
+        result = await get_data_availability(
+            client=mock_client,
+            dataflow_id="DF_COMMODITY_PRICES",
+            filters={"FREQ": "M", "GEO_PICT": "FJ"},
+        )
+
+        assert "error" in result
+        mock_session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_time_period_is_accepted_as_a_filter_name(self, mock_client):
+        """TIME_PERIOD is an accepted alias for the time dimension, so the new
+        validation must not reject it."""
+        mock_session = AsyncMock()
+        mock_session.get = AsyncMock(return_value=self._make_response(self.EXACT_CONSTRAINT_XML))
+        mock_client._get_session = AsyncMock(return_value=mock_session)
+
+        result = await get_data_availability(
+            client=mock_client,
+            dataflow_id="DF_COMMODITY_PRICES",
+            filters={"TIME_PERIOD": "2020"},
+        )
+
+        assert "error" not in result
+
+
+class TestActualAvailabilityFallback:
+    """get_actual_availability() must fall back to Allowed constraints (ECB
+    publishes only Allowed) and must explain itself when nothing is published,
+    rather than silently returning an empty result."""
+
+    ALLOWED_ONLY_XML = (
+        '<?xml version="1.0"?>'
+        '<mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"'
+        ' xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"'
+        ' xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">'
+        "<mes:Structures><str:Constraints>"
+        '<str:ContentConstraint id="EXR_CONSTRAINTS" type="Allowed">'
+        '<str:CubeRegion include="true">'
+        '<com:KeyValue id="CURRENCY"><com:Value>USD</com:Value>'
+        "<com:Value>GBP</com:Value></com:KeyValue>"
+        "</str:CubeRegion>"
+        "</str:ContentConstraint>"
+        "</str:Constraints></mes:Structures></mes:Structure>"
+    )
+
+    # The Allowed constraint appears first in document order; the Actual one
+    # comes second. If the parser ever regresses to "first match wins" this
+    # fixture will catch it, since the naive result would be "Allowed".
+    ACTUAL_AND_ALLOWED_XML = (
+        '<?xml version="1.0"?>'
+        '<mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"'
+        ' xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"'
+        ' xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">'
+        "<mes:Structures><str:Constraints>"
+        '<str:ContentConstraint id="CC_ALLOWED" type="Allowed">'
+        '<str:CubeRegion include="true">'
+        '<com:KeyValue id="FREQ"><com:Value>A</com:Value>'
+        "<com:Value>M</com:Value></com:KeyValue>"
+        "</str:CubeRegion>"
+        "</str:ContentConstraint>"
+        '<str:ContentConstraint id="CC_ACTUAL" type="Actual">'
+        '<str:CubeRegion include="true">'
+        '<com:KeyValue id="FREQ"><com:Value>A</com:Value></com:KeyValue>'
+        "</str:CubeRegion>"
+        "</str:ContentConstraint>"
+        "</str:Constraints></mes:Structures></mes:Structure>"
+    )
+
+    NO_CONSTRAINT_XML = (
+        '<?xml version="1.0"?>'
+        '<mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message"'
+        ' xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"'
+        ' xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">'
+        "<mes:Structures><str:Constraints>"
+        "</str:Constraints></mes:Structures></mes:Structure>"
+    )
+
+    def _client_returning(self, xml_text, endpoint_key):
+        """Real SDMXProgressiveClient whose HTTP session is mocked to return xml_text."""
+        client = SDMXProgressiveClient(
+            base_url="https://example.com/rest",
+            agency_id=endpoint_key,
+            endpoint_key=endpoint_key,
+        )
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.content = xml_text.encode("utf-8")
+        resp.raise_for_status = MagicMock()
+        mock_session = AsyncMock()
+        mock_session.get = AsyncMock(return_value=resp)
+        client._get_session = AsyncMock(return_value=mock_session)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_availability_falls_back_to_an_allowed_constraint(self):
+        """ECB publishes Allowed constraints only. Returning nothing at all,
+        as the tool used to, hides data the provider is telling us about."""
+        client = self._client_returning(self.ALLOWED_ONLY_XML, endpoint_key="ECB")
+        result = await client.get_actual_availability("EXR", agency_id="ECB")
+        assert result["has_constraint"] is True
+        assert result["constraint_type"] == "Allowed"
+        assert any("CURRENCY" in str(r) for r in result["cube_regions"])
+
+    @pytest.mark.asyncio
+    async def test_availability_prefers_actual_when_both_exist(self):
+        client = self._client_returning(self.ACTUAL_AND_ALLOWED_XML, endpoint_key="SPC")
+        result = await client.get_actual_availability("DF_X", agency_id="SPC")
+        assert result["constraint_type"] == "Actual"
+        assert result["constraint_id"] == "CC_ACTUAL"
+
+    @pytest.mark.asyncio
+    async def test_availability_result_explains_an_empty_answer(self):
+        """An empty availability answer must say why, not just be empty."""
+        client = self._client_returning(self.NO_CONSTRAINT_XML, endpoint_key="ESTAT")
+        out = await get_data_availability(client, "nama_10_gdp", agency_id="ESTAT")
+        assert out["has_constraint"] is False
+        assert out["note"]
+
+
 class TestContextIntegration:
     """Test MCP Context integration."""
 
@@ -463,6 +843,67 @@ class TestContextIntegration:
         # Should succeed regardless of context
         assert "dataflows" in result
         assert result["total_found"] == 1
+
+
+class TestMainServerListDataflows:
+    """Test MCP-facing list_dataflows handler argument normalization."""
+
+    @pytest.mark.asyncio
+    async def test_handler_accepts_string_keywords(self):
+        """String keywords should be normalised for MCP callers."""
+        from main_server import list_dataflows as handler
+
+        mock_client = MagicMock(spec=SDMXProgressiveClient)
+        mock_client.agency_id = "SPC"
+        mock_client.endpoint_key = "SPC"
+        mock_client.discover_dataflows = AsyncMock(
+            return_value=[
+                {
+                    "id": "DF_COMMODITY_PRICES",
+                    "name": "Selected International Commodity Prices",
+                    "description": "Nominal prices in USD for key commodities",
+                }
+            ]
+        )
+
+        with patch("main_server.get_session_client", return_value=mock_client):
+            result = await handler(keywords="commodity prices")
+
+        assert result.total_found == 1
+        assert result.keywords == ["commodity", "prices"]
+        assert result.dataflows[0].id == "DF_COMMODITY_PRICES"
+
+    @pytest.mark.asyncio
+    async def test_handler_defaults_fresh_to_false(self):
+        from main_server import list_dataflows as handler
+
+        mock_client = MagicMock(spec=SDMXProgressiveClient)
+        mock_client.agency_id = "SPC"
+        mock_client.endpoint_key = "SPC"
+        mock_client.discover_dataflows = AsyncMock(return_value=[])
+
+        with patch("main_server.get_session_client", return_value=mock_client):
+            await handler()
+
+        _, kwargs = mock_client.discover_dataflows.call_args
+        assert kwargs.get("fresh") is False
+
+    @pytest.mark.asyncio
+    async def test_handler_threads_fresh_through_to_discover_dataflows(self):
+        """fresh=True on the tool must reach discover_dataflows(), so a
+        liveness check bypassing the tool-level cache actually skips it."""
+        from main_server import list_dataflows as handler
+
+        mock_client = MagicMock(spec=SDMXProgressiveClient)
+        mock_client.agency_id = "SPC"
+        mock_client.endpoint_key = "SPC"
+        mock_client.discover_dataflows = AsyncMock(return_value=[])
+
+        with patch("main_server.get_session_client", return_value=mock_client):
+            await handler(fresh=True)
+
+        _, kwargs = mock_client.discover_dataflows.call_args
+        assert kwargs.get("fresh") is True
 
 
 class TestCompareDataflowDimensions:
@@ -600,7 +1041,9 @@ class TestCompareDataflowDimensions:
         """Create a mock AppContext with session state."""
         session_state = MagicMock()
         session_state.endpoint_key = "SPC"
+        session_state.default_endpoint_key = "SPC"
         session_state.client = mock_session_client
+        session_state.get_or_create_client = AsyncMock(return_value=mock_session_client)
 
         app_ctx = MagicMock()
         app_ctx.get_session.return_value = session_state
@@ -759,15 +1202,15 @@ class TestCompareDataflowDimensions:
 
     @pytest.mark.asyncio
     @patch("main_server._fetch_constraint_info")
-    @patch("main_server._get_client_for_endpoint")
+    @patch("main_server._resolve_client")
     @patch("main_server.get_app_context")
     @patch("main_server.get_session_client")
     async def test_cross_provider(self, mock_get_client, mock_get_app,
-                                  mock_get_endpoint_client, mock_fetch_info,
+                                  mock_resolve_client, mock_fetch_info,
                                   mock_session_client,
                                   mock_app_context, mock_structure_a, mock_structure_b,
                                   mock_overview_a, mock_overview_b):
-        """Cross-provider: endpoint_a='SPC', endpoint_b='IMF' creates temp client."""
+        """Cross-provider: endpoint_a=None, endpoint_b='IMF' resolves to pooled clients."""
         from main_server import _ConstraintInfo, compare_dataflow_dimensions
 
         mock_get_client.return_value = mock_session_client
@@ -782,12 +1225,12 @@ class TestCompareDataflowDimensions:
         imf_client.get_dataflow_overview = AsyncMock(return_value=mock_overview_b)
         imf_client.close = AsyncMock()
 
-        def side_effect(endpoint_key, session_client, session_endpoint_key):
-            if endpoint_key == "IMF":
-                return (imf_client, "IMF", True)
-            return (session_client, session_endpoint_key, False)
+        async def resolve_side_effect(ctx, endpoint):
+            if endpoint == "IMF":
+                return (imf_client, "IMF")
+            return (mock_session_client, "SPC")
 
-        mock_get_endpoint_client.side_effect = side_effect
+        mock_resolve_client.side_effect = resolve_side_effect
 
         result = await compare_dataflow_dimensions(
             "DF_A", "DF_B", endpoint_a=None, endpoint_b="IMF", ctx=None,
@@ -795,8 +1238,6 @@ class TestCompareDataflowDimensions:
 
         assert result.endpoint_a == "SPC"
         assert result.endpoint_b == "IMF"
-        # Verify temp client was closed
-        imf_client.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     @patch("main_server.get_app_context")
@@ -882,7 +1323,7 @@ class TestAgencyIdResolution:
         client.endpoint_key = "ECB"
         client.discover_dataflows = AsyncMock(return_value=[])
 
-        result = await list_dataflows(client=client)
+        await list_dataflows(client=client)
 
         # Verify discover_dataflows was called with ECB, not SPC
         client.discover_dataflows.assert_called_once()
@@ -897,7 +1338,7 @@ class TestAgencyIdResolution:
         client.endpoint_key = "ECB"
         client.discover_dataflows = AsyncMock(return_value=[])
 
-        result = await list_dataflows(client=client, agency_id="UNICEF")
+        await list_dataflows(client=client, agency_id="UNICEF")
 
         # Verify discover_dataflows was called with UNICEF
         client.discover_dataflows.assert_called_once()
@@ -987,26 +1428,17 @@ class TestEndpointKeyThreading:
         )
         assert client.endpoint_key is None
 
-    def test_session_manager_passes_endpoint_key(self):
-        """SessionManager should pass endpoint_key to client."""
-        from session_manager import SessionManager
-
-        manager = SessionManager()
-        session = manager.get_session("test-session")
-        assert session.client.endpoint_key == "SPC"  # Default endpoint
-
     @pytest.mark.asyncio
-    async def test_session_switch_updates_endpoint_key(self):
-        """Switching endpoint should update client's endpoint_key."""
+    async def test_session_manager_passes_endpoint_key(self):
+        """SessionManager should seed session with default endpoint key."""
         from session_manager import SessionManager
 
         manager = SessionManager()
-        await manager.switch_endpoint("ECB", session_id="test-session")
         session = manager.get_session("test-session")
-        assert session.client.endpoint_key == "ECB"
-        assert session.client.agency_id == "ECB"
+        assert session.default_endpoint_key == "SPC"  # Default endpoint
+        client = await session.get_or_create_client(session.default_endpoint_key)
+        assert client.endpoint_key == "SPC"
         await manager.close_all()
-
 
 class TestConstraintStrategies:
     """Test _fetch_constraint_info with different constraint strategies."""
@@ -1196,3 +1628,97 @@ class TestConstraintConfigStrategies:
         assert get_constraint_strategy("ESTAT", "single_flow") is None
         assert get_constraint_strategy("ESTAT", "bulk") is None
 
+
+class TestDataflowSummaryCarriesAgency:
+    """list_dataflows must report each dataflow's owning agency.
+
+    OECD publishes under sub-agencies (OECD.CFE.EDS, OECD.SDD.TPS, and others)
+    and also mirrors flows owned by ESTAT and IAEG-SDGs, so the agency is not
+    derivable from the endpoint. DataflowSummary.agency defaults to "", so
+    failing to pass it produces an empty string rather than an error, and the
+    caller then builds structure and data URLs against the wrong agency.
+    """
+
+    @pytest.fixture
+    def oecd_dataflows(self):
+        return [
+            {
+                "id": "DSD_FUA_CLIM@DF_CLIM_PROJ",
+                "agency": "OECD.CFE.EDS",
+                "version": "1.4",
+                "name": "Climate projections",
+                "description": "Projected climate indicators",
+            },
+            {
+                "id": "SEEA_AEA_A",
+                "agency": "ESTAT",
+                "version": "1.4",
+                "name": "Air emissions accounts",
+                "description": "Mirrored from Eurostat",
+            },
+        ]
+
+    @pytest.mark.asyncio
+    @patch("main_server.get_app_context")
+    @patch("main_server._resolve_client")
+    async def test_agency_is_reported_for_each_dataflow(
+        self, mock_resolve, mock_get_app, oecd_dataflows
+    ):
+        from main_server import list_dataflows as list_dataflows_tool
+
+        client = MagicMock(spec=SDMXProgressiveClient)
+        client.agency_id = "all"
+        client.endpoint_key = "OECD"
+        client.discover_dataflows = AsyncMock(return_value=oecd_dataflows)
+        mock_resolve.return_value = (client, "OECD")
+        mock_get_app.return_value = None
+
+        result = await list_dataflows_tool(ctx=None)
+
+        by_id = {df.id: df for df in result.dataflows}
+        assert by_id["DSD_FUA_CLIM@DF_CLIM_PROJ"].agency == "OECD.CFE.EDS"
+        # A mirrored flow keeps its own owner, not the endpoint's default.
+        assert by_id["SEEA_AEA_A"].agency == "ESTAT"
+
+    @pytest.mark.asyncio
+    @patch("main_server.get_app_context")
+    @patch("main_server._resolve_client")
+    async def test_structure_reports_the_agency_it_resolved_under(
+        self, mock_resolve, mock_get_app
+    ):
+        """get_dataflow_structure must say which agency it used, and which
+        agency and version own the DSD. Without them an agent that started from
+        list_dataflows cannot rebuild a URL for an OECD sub-agency flow."""
+        from main_server import get_dataflow_structure as structure_tool
+
+        client = MagicMock(spec=SDMXProgressiveClient)
+        client.agency_id = "OECD.CFE.EDS"
+        client.endpoint_key = "OECD"
+        client.get_dataflow_overview = AsyncMock(
+            return_value=DataflowOverview(
+                id="DSD_FUA_CLIM@DF_CLIM_PROJ",
+                agency="OECD.CFE.EDS",
+                version="1.4",
+                name="Climate projections",
+                description="Projected climate indicators",
+            )
+        )
+        client.get_structure_summary = AsyncMock(
+            return_value=DataStructureSummary(
+                id="DSD_FUA_CLIM",
+                agency="OECD.CFE.EDS",
+                version="1.4",
+                dimensions=[DimensionInfo(id="FREQ", position=1, type="Dimension")],
+                key_family=["FREQ"],
+                attributes=[],
+                primary_measure="OBS_VALUE",
+            )
+        )
+        mock_resolve.return_value = (client, "OECD")
+        mock_get_app.return_value = None
+
+        result = await structure_tool("DSD_FUA_CLIM@DF_CLIM_PROJ", ctx=None)
+
+        assert result.dataflow.agency == "OECD.CFE.EDS"
+        assert result.structure.agency == "OECD.CFE.EDS"
+        assert result.structure.version == "1.4"

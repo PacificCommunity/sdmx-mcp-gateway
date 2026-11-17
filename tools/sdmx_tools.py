@@ -14,14 +14,16 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sdmx_progressive_client import SDMXProgressiveClient
+from sdmx_progressive_client import DATAFLOW_CACHE_TTL_S, SDMXProgressiveClient
 from utils import (
+    SDMX_NAMESPACES,
     filter_dataflows_by_keywords,
     validate_dataflow_id,
     validate_period,
@@ -34,6 +36,49 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dataflow_cache_status_note(client: SDMXProgressiveClient) -> str:
+    """Describe how the client's last discover_dataflows() call was served.
+
+    Reads getattr() with defaults rather than the attributes directly: a
+    mock client, or a client whose discover_dataflows() was replaced
+    wholesale in a test, never sets them, and the sensible default for that
+    case is "freshly fetched" rather than raising.
+    """
+    from_cache = getattr(client, "last_dataflow_cache_hit", False)
+    if not from_cache:
+        return "Freshly fetched from the provider."
+    age_s = getattr(client, "last_dataflow_cache_age_s", None)
+    if age_s is None:
+        return "Served from cache."
+    return f"Served from cache (age: {int(age_s)}s, TTL {DATAFLOW_CACHE_TTL_S:.0f}s)."
+
+
+def structure_url(
+    client: SDMXProgressiveClient, agency: str, dataflow_id: str, version: str = "latest"
+) -> str | None:
+    """
+    Full-structure URL (``references=all``) for a dataflow on the client's provider.
+
+    This is the one URL a downstream SDMX-ML parser needs to load the dataflow,
+    its DSD and every codelist in a single request (SDMXerWizard's ``load_schema``
+    takes it verbatim). Returns ``None`` when the client carries no ``base_url``,
+    so callers never fail merely because the field cannot be built.
+    """
+    base_url = getattr(client, "base_url", None)
+    if not isinstance(base_url, str) or not base_url:
+        return None
+    return (
+        base_url.rstrip("/")
+        + "/dataflow/"
+        + agency
+        + "/"
+        + dataflow_id
+        + "/"
+        + version
+        + "?references=all"
+    )
+
+
 async def list_dataflows(
     client: SDMXProgressiveClient,
     keywords: list[str] | None = None,
@@ -41,6 +86,7 @@ async def list_dataflows(
     limit: int = 10,
     offset: int = 0,
     ctx: Context[Any, Any, Any] | None = None,
+    fresh: bool = False,
 ) -> dict[str, Any]:
     """
     Step 1: Discover available dataflows with minimal metadata.
@@ -55,6 +101,10 @@ async def list_dataflows(
         limit: Number of results to return (default: 10)
         offset: Number of results to skip for pagination (default: 0)
         ctx: MCP context for progress reporting
+        fresh: Bypass the module-level dataflow listing cache and force a
+            live re-fetch. The fetched result still refreshes the cache for
+            other callers. Use this for liveness checks, where a cached
+            answer would hide a provider that is actually unreachable.
     """
     try:
         agency_id = agency_id or client.agency_id
@@ -66,6 +116,7 @@ async def list_dataflows(
             agency_id=agency_id,
             references="none",
             ctx=ctx,
+            fresh=fresh,
         )
 
         # Filter by keywords if provided
@@ -81,16 +132,20 @@ async def list_dataflows(
         dataflows = filtered_dataflows[start_idx:end_idx]
 
         # Create lightweight summaries
-        summaries: list[dict[str, str]] = []
+        summaries: list[dict[str, Any]] = []
         for df in dataflows:
             desc = str(df.get("description", ""))
             if len(desc) > 100:
                 desc = desc[:100] + "..."
+            df_id = str(df.get("id", ""))
+            df_agency = str(df.get("agency", "")) or str(agency_id)
             summaries.append(
                 {
-                    "id": str(df.get("id", "")),
+                    "id": df_id,
+                    "agency": str(df.get("agency", "")),
                     "name": str(df.get("name", "")),
                     "description": desc,
+                    "structure_url": structure_url(client, df_agency, df_id),
                 }
             )
 
@@ -143,6 +198,10 @@ async def list_dataflows(
                 "To discover all dataflows for a country or code, use "
                 "find_code_usage_across_dataflows(code, dimension_id)."
             )
+
+        # Cache status goes first so a caller can't miss it: a consumer must
+        # be able to tell a fresh listing from a cached one without guessing.
+        result["next_step"] = _dataflow_cache_status_note(client) + " " + result["next_step"]
 
         return result
 
@@ -259,6 +318,7 @@ async def get_dataflow_structure(
             "dataflow_id": dataflow_id,
             "agency_id": agency_id,
             "dataflow_name": dataflow_name,
+            "structure_url": structure_url(client, str(agency_id), dataflow_id),
             "total_dimensions": len(dimensions_summary),
             "structure": {
                 "id": structure_dict.get("id", ""),
@@ -377,6 +437,8 @@ async def get_data_availability(
         ctx: MCP context for progress reporting
     """
     try:
+        from config import get_constraint_strategy
+
         agency_id = agency_id or client.agency_id
 
         # Validate input
@@ -389,34 +451,71 @@ async def get_data_availability(
         if ctx:
             await ctx.info(f"Checking data availability for: {dataflow_id}")
 
-        availability = await client.get_actual_availability(
-            dataflow_id=dataflow_id,
-            agency_id=agency_id,
-            ctx=ctx,
-        )
+        # Reject filters that name no dimension of this dataflow. Silently
+        # dropping them used to return the whole-dataflow answer while
+        # reporting the filter as checked, so a stale dimension id (GEO_PICT,
+        # renamed to REF_AREA in DSD_SDG 4.x) produced a confident count for a
+        # selection nobody asked about.
+        if filters:
+            structure = await client.get_structure_summary(
+                dataflow_id=dataflow_id,
+                agency_id=agency_id,
+            )
+            valid = [
+                dim.id for dim in sorted(structure.dimensions, key=lambda d: d.position)
+            ]
+            unknown = [key for key in filters if key not in set(valid) | {"TIME_PERIOD"}]
+            if unknown:
+                return {
+                    "dataflow_id": dataflow_id,
+                    "has_constraint": False,
+                    "error": (
+                        "Unknown dimension(s) for " + dataflow_id + ": "
+                        + ", ".join(sorted(unknown))
+                    ),
+                    "interpretation": [
+                        "**Valid dimensions for " + dataflow_id + ":** " + ", ".join(valid),
+                        "**Unknown filter(s) rejected:** " + ", ".join(sorted(unknown)),
+                    ],
+                    "recommendation": (
+                        "Re-run using dimension ids from the list above. Dimension ids "
+                        "change between dataflow versions, so one that worked on an "
+                        "earlier version may no longer exist. Call "
+                        "get_dataflow_structure() to see the current dimensions."
+                    ),
+                }
 
-        # The availability check returns constraint info
-        has_data = availability.get("has_constraint", False)
-        time_range = availability.get("time_range", {})
+        strategy = get_constraint_strategy(client.endpoint_key, "single_flow")
+        if strategy == "availableconstraint":
+            availability = await _get_exact_availability_from_endpoint(
+                client=client,
+                dataflow_id=dataflow_id,
+                agency_id=agency_id,
+                filters=filters,
+            )
+        else:
+            availability = await client.get_actual_availability(
+                dataflow_id=dataflow_id,
+                agency_id=agency_id,
+                ctx=ctx,
+            )
 
         result: dict[str, Any] = {
             "discovery_level": "availability",
             "dataflow_id": dataflow_id,
             "agency_id": agency_id,
-            "filters_applied": filters,
-            "has_data": has_data,
-            "observation_count": None,
-            "time_period": time_range if time_range else None,
-            "series_count": None,
+            "has_constraint": availability.get("has_constraint", False),
+            "constraint_id": availability.get("constraint_id"),
+            "constraint_type": availability.get("constraint_type"),
+            "note": availability.get("note"),
+            "time_range": availability.get("time_range"),
+            "cube_regions": availability.get("cube_regions", []),
+            "interpretation": availability.get("interpretation", []),
+            "dimension_values_checked": filters,
+            "data_exists": availability.get("data_exists"),
+            "observation_count": availability.get("observation_count"),
+            "recommendation": availability.get("recommendation"),
         }
-
-        if has_data:
-            result["next_step"] = "Use build_data_url() to get the full data URL for retrieval"
-        else:
-            result["next_step"] = (
-                "Try different filters - use get_dimension_codes() to see available codes"
-            )
-            result["suggestions"] = []
 
         return result
 
@@ -427,6 +526,217 @@ async def get_data_availability(
             "dataflow_id": dataflow_id,
             "hint": "This endpoint might not support availability queries. Try build_data_url() directly.",
         }
+
+
+async def _get_exact_availability_from_endpoint(
+    client: SDMXProgressiveClient,
+    dataflow_id: str,
+    agency_id: str,
+    filters: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Query /availableconstraint in exact mode for a dataflow selection."""
+    key, time_period = await _build_availableconstraint_key(
+        client=client,
+        dataflow_id=dataflow_id,
+        agency_id=agency_id,
+        filters=filters or {},
+    )
+    base_url = client.base_url.rstrip("/")
+    url = (
+        base_url
+        + "/availableconstraint/"
+        + dataflow_id
+        + "/"
+        + key
+        + "/all/all"
+    )
+    params = {"mode": "exact"}
+    if time_period:
+        params["startPeriod"] = time_period
+        params["endPeriod"] = time_period
+    url += "?" + urlencode(params)
+
+    session = await client._get_session()
+    response = await session.get(
+        url,
+        headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"},
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    return _parse_availableconstraint_response(
+        response.content,
+        dataflow_id=dataflow_id,
+        filters=filters or {},
+        source_url=url,
+    )
+
+
+async def _build_availableconstraint_key(
+    client: SDMXProgressiveClient,
+    dataflow_id: str,
+    agency_id: str,
+    filters: dict[str, str] | None,
+) -> tuple[str, str | None]:
+    """Build a correctly ordered key and extract any time-period filter."""
+    filters = filters or {}
+    structure = await client.get_structure_summary(
+        dataflow_id=dataflow_id,
+        agency_id=agency_id,
+    )
+
+    key_parts: list[str] = []
+    time_period: str | None = None
+    for dim in sorted(structure.dimensions, key=lambda d: d.position):
+        if dim.type == "TimeDimension":
+            time_period = filters.get(dim.id) or filters.get("TIME_PERIOD")
+            continue
+        key_parts.append(filters.get(dim.id, ""))
+
+    # A key with no filters set joins to e.g. "..": path normalisation then
+    # collapses ".../<dataflow_id>/.." to "...", silently dropping the
+    # dataflow from the request URL (see incident notes for DF_ADBKI/SPC).
+    # Only fall back to the wildcard when every part is empty; a partially
+    # filled key (e.g. "A..FJ") is legitimate SDMx and must be preserved.
+    if not any(key_parts):
+        return "all", time_period
+
+    return ".".join(key_parts), time_period
+
+
+def _parse_availableconstraint_response(
+    xml_content: bytes,
+    dataflow_id: str,
+    filters: dict[str, str],
+    source_url: str,
+) -> dict[str, Any]:
+    """Parse an exact availableconstraint response into tool output."""
+    root = ET.fromstring(xml_content)
+    constraint = root.find(".//str:ContentConstraint", SDMX_NAMESPACES)
+    if constraint is None:
+        return {
+            "dataflow_id": dataflow_id,
+            "has_constraint": False,
+            "interpretation": ["No ContentConstraint returned by provider."],
+            "recommendation": "Try querying the data directly.",
+        }
+
+    observation_count = _extract_observation_count(constraint)
+    cube_regions: list[dict[str, Any]] = []
+    time_range = _extract_time_range_and_regions(constraint, cube_regions)
+    sentinel_empty = _is_inverted_empty_time_range(time_range)
+    if sentinel_empty:
+        time_range = None
+
+    has_data = observation_count is None or observation_count > 0
+
+    interpretation: list[str] = [
+        "**Dataflow:** " + dataflow_id,
+        "**Availability source:** /availableconstraint (mode=exact)",
+    ]
+    if filters:
+        interpretation.append("**Filters checked:** " + ", ".join(
+            key + "=" + value for key, value in filters.items()
+        ))
+    if observation_count is not None:
+        interpretation.append("**Observation count:** " + str(observation_count))
+    if sentinel_empty:
+        interpretation.append(
+            "**Provider note:** SPC returned an empty sentinel time range "
+            "(9999-01-01 to 0001-12-31) with obs_count=0."
+        )
+    elif time_range:
+        interpretation.append(
+            "**Time range:** " + str(time_range["start"]) + " to " + str(time_range["end"])
+        )
+
+    recommendation = (
+        "Use build_data_url() to fetch data for this selection."
+        if has_data
+        else "No data exists for this exact selection. Relax one filter or widen the time range."
+    )
+
+    return {
+        "dataflow_id": dataflow_id,
+        "has_constraint": True,
+        "constraint_id": constraint.get("id"),
+        # Actual means combinations with confirmed data; Allowed means merely
+        # schema-permitted. Reporting Allowed as if it were Actual makes every
+        # availability answer over-optimistic, so carry the distinction.
+        "constraint_type": constraint.get("type"),
+        "time_range": time_range,
+        "cube_regions": cube_regions,
+        "interpretation": interpretation,
+        "dimension_values_checked": filters or None,
+        "data_exists": has_data,
+        "observation_count": observation_count,
+        "recommendation": recommendation,
+        "source_url": source_url,
+    }
+
+
+def _extract_observation_count(constraint: ET.Element) -> int | None:
+    """Extract provider-specific obs_count annotation if present."""
+    for annotation in constraint.findall(".//com:Annotation", SDMX_NAMESPACES):
+        if annotation.get("id") != "obs_count":
+            continue
+        title = annotation.find("./com:AnnotationTitle", SDMX_NAMESPACES)
+        if title is not None and title.text:
+            try:
+                return int(title.text)
+            except ValueError:
+                return None
+    return None
+
+
+def _extract_time_range_and_regions(
+    constraint: ET.Element,
+    cube_regions: list[dict[str, Any]],
+) -> dict[str, str] | None:
+    """Extract cube regions plus overall time range from a constraint."""
+    time_starts: list[str] = []
+    time_ends: list[str] = []
+
+    for cube_region in constraint.findall(".//str:CubeRegion", SDMX_NAMESPACES):
+        region_keys: dict[str, list[str]] = {}
+        for key_value in cube_region.findall("./com:KeyValue", SDMX_NAMESPACES):
+            dim_id = key_value.get("id", "")
+            values = [
+                value.text for value in key_value.findall("./com:Value", SDMX_NAMESPACES)
+                if value.text
+            ]
+            time_range = key_value.find("./com:TimeRange", SDMX_NAMESPACES)
+            if time_range is not None:
+                start_el = time_range.find("./com:StartPeriod", SDMX_NAMESPACES)
+                end_el = time_range.find("./com:EndPeriod", SDMX_NAMESPACES)
+                values = []
+                if start_el is not None and start_el.text:
+                    time_starts.append(start_el.text[:10])
+                if end_el is not None and end_el.text:
+                    time_ends.append(end_el.text[:10])
+            if values:
+                region_keys[dim_id] = values
+        cube_regions.append({
+            "included": cube_region.get("include", "true") == "true",
+            "keys": region_keys,
+        })
+
+    if not time_starts or not time_ends:
+        return None
+    return {
+        "start": min(time_starts),
+        "end": max(time_ends),
+    }
+
+
+def _is_inverted_empty_time_range(time_range: dict[str, str] | None) -> bool:
+    """Detect the SPC empty-result sentinel time range."""
+    if not time_range:
+        return False
+    return (
+        time_range.get("start") == "9999-01-01"
+        and time_range.get("end") == "0001-12-31"
+    )
 
 
 async def validate_query(
@@ -590,27 +900,11 @@ async def validate_query(
         return validation_results
 
 
-def _get_accept_header(output_format: str) -> str:
-    """
-    Get the Accept header value for a given output format.
+def _get_accept_header(output_format: str, endpoint_key: str | None = None) -> str:
+    """Accept header for a data format, honouring per-provider divergence."""
+    from config import get_data_accept
 
-    Args:
-        output_format: One of 'csv', 'json', 'xml', 'generic', 'structurespecific'
-
-    Returns:
-        MIME type string for Accept header
-    """
-    format_map = {
-        "csv": "application/vnd.sdmx.data+csv;version=1.0.0",
-        "json": "application/vnd.sdmx.data+json;version=1.0.0",
-        "xml": "application/vnd.sdmx.genericdata+xml;version=2.1",
-        "generic": "application/vnd.sdmx.genericdata+xml;version=2.1",
-        "structurespecific": "application/vnd.sdmx.structurespecificdata+xml;version=2.1",
-        "sdmx-json": "application/vnd.sdmx.data+json;version=1.0.0",
-        "sdmx-csv": "application/vnd.sdmx.data+csv;version=1.0.0",
-        "sdmx-xml": "application/vnd.sdmx.genericdata+xml;version=2.1",
-    }
-    return format_map.get(output_format.lower(), format_map["csv"])
+    return get_data_accept(endpoint_key, output_format)
 
 
 async def build_data_url(
@@ -708,7 +1002,7 @@ async def build_data_url(
         url = f"{base_url}/data/{dataflow_id}/{data_key}"
 
         # Add query parameters
-        params: list[str] = []
+        params: list[str] = ["dimensionAtObservation=AllDimensions"]
         if start_period:
             params.append(f"startPeriod={quote(start_period)}")
         if end_period:
@@ -727,9 +1021,13 @@ async def build_data_url(
             "format": output_format,
         }
 
+        # Computed once so the returned headers and the usage curl line can
+        # never disagree about which media type the endpoint actually accepts.
+        accept = _get_accept_header(output_format, getattr(client, "endpoint_key", None))
+
         if include_headers:
             result["headers"] = {
-                "Accept": _get_accept_header(output_format),
+                "Accept": accept,
                 "Accept-Language": "en",
             }
 
@@ -742,7 +1040,7 @@ async def build_data_url(
         if validation_warnings:
             result["warnings"] = validation_warnings
 
-        result["usage"] = f"curl -H 'Accept: {_get_accept_header(output_format)}' '{url}'"
+        result["usage"] = f"curl -H 'Accept: {accept}' '{url}'"
 
         return result
 
@@ -810,11 +1108,27 @@ async def get_discovery_guide(
                 "description": "Generate the final data retrieval URL",
                 "example": "build_data_url('DF_POP', filters={'GEO': 'FJ'})",
             },
+            {
+                "step": 6,
+                "name": "Probe Exact Query",
+                "tool": "probe_data_url",
+                "description": "Confirm the exact URL is non-empty before consuming it",
+                "example": "probe_data_url(data_url='https://example.org/rest/data/DF_POP/A.FJ')",
+            },
+            {
+                "step": 7,
+                "name": "Recover from Empty Results",
+                "tool": "suggest_nonempty_queries",
+                "description": "Suggest nearby non-empty relaxations when the exact query is empty",
+                "example": "suggest_nonempty_queries(data_url='https://example.org/rest/data/DF_POP/A.FJ')",
+            },
         ],
         "tips": [
             "Use keywords to filter dataflows by topic",
             "Start with overview, then drill down progressively",
             "Check availability before building final URLs",
+            "Probe exact URLs before downstream rendering or dashboard updates",
+            "Use suggest_nonempty_queries() instead of guessing which filter to relax",
             "Use pagination for large result sets",
         ],
     }
@@ -902,24 +1216,3 @@ async def build_sdmx_key(
     except Exception as e:
         logger.exception("Failed to build key for %s", dataflow_id)
         return {"error": str(e), "dataflow_id": dataflow_id}
-
-
-def get_default_client() -> SDMXProgressiveClient:
-    """
-    Get a default SDMX client for backward compatibility.
-
-    DEPRECATED: Use session-based clients instead.
-    """
-    return SDMXProgressiveClient()
-
-
-# Legacy global client for backward compatibility during migration
-# Will be removed in future versions
-sdmx_client = get_default_client()
-
-
-async def cleanup_sdmx_client() -> None:
-    """Clean up the legacy SDMX client session."""
-    global sdmx_client
-    if sdmx_client and sdmx_client.session:
-        await sdmx_client.close()
